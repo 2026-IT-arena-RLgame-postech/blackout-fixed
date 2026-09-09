@@ -1,16 +1,33 @@
 using UnityEngine;
 
 /// <summary>
-/// Renders a semantic ID map of the game state to two RenderTextures (one per team perspective).
-/// Each pixel stores an entity type ID (wall, storage, unit, item) as a grayscale value.
-/// Team A and Team B see ally/enemy IDs flipped relative to each other.
+/// Renders a bit-packed semantic map of the game state to two single-channel (R16) RenderTextures,
+/// one per team perspective. Each pixel is a 16-bit value packing three fields (see below).
+/// Team A and Team B see ally/enemy tile categories flipped relative to each other.
+/// Units are NOT represented here — unit positions are carried entirely by the vector observation.
 ///
-/// ID encoding (must match StreamingAssets/semantic_map_config.json and Python preprocessor):
-///   0=empty, 1=wall, 2=ally_storage, 3=enemy_storage, 4=ally_unit, 5=enemy_unit, 6+=item
+/// Pixel bit layout (must match Python's MyObsPreprocessor):
+///   bit 0-2 : base tile category (static, computed once per episode)
+///             0=void 1=wall 2=site_hunter 3=site_carrier
+///             4=spawn_ally 5=spawn_enemy 6=storage_ally 7=storage_enemy
+///   bit 3-6 : battery stack count on this tile, saturated to [0,15] (covers the current
+///             MaxItemAmount of 10 exactly, with headroom to 15 if it's raised later)
+///   bit 7-9 : index of the non-battery item on this tile (0=none, 1=BuffSpeed, 2=DebuffSpeed,
+///             3=BuffSize, 4=DebuffSize; 5-7 reserved for future items — see KnownItems ordering)
+///   Packed value range is 0-1023 (all 10 bits used). Written to the texture as a raw ushort and
+///   normalized by PACK_DIVISOR when read by the ML-Agents sensor (see MapObsAgent.cs).
+///
+/// Base and item fields are combined with bitwise OR — this only works because at most one item
+/// ever occupies a given tile (enforced by Storage's merge logic and ground-spawn placement), so the
+/// battery/item-index bit ranges never collide with each other.
+///
+/// R16 (16-bit single-channel, non-color) is used instead of RGB/ARGB so the pixel value round-trips
+/// as an exact integer — no sRGB/gamma conversion applies to this format, unlike the previous
+/// RGB24/ARGB32 approach which needed a manual sRGB round-trip to avoid corrupting small values.
 ///
 /// Usage:
 ///   1. Attach to a GameObject in the ML training scene.
-///   2. Set references in inspector (gameScenario, coordinator, defaultMapSize, resolutionScale).
+///   2. Set references in inspector (gameScenario, knownItems, siteHunterTileData, siteCarrierTileData, ...).
 ///   3. BlackOutEpisodeCoordinator calls CreateTextures() in Awake, then assigns RTs to agents.
 ///   4. BlackOutEpisodeCoordinator calls Render() each FixedUpdate.
 /// </summary>
@@ -18,23 +35,37 @@ public class SemanticMapRenderer : MonoBehaviour
 {
     [Header("References")]
     [SerializeField] private GameScenario gameScenario;
+    [Tooltip("Known item types in item-index encoding order. Index 0 MUST be the battery (stack count encoded); indices 1+ are presence-only items (max 7 supported by the 3-bit field).")]
     [SerializeField] private ItemData[] knownItems;
+    [Tooltip("Tile data asset identifying 'hunter site' tiles.")]
+    [SerializeField] private MapTileData siteHunterTileData;
+    [Tooltip("Tile data asset identifying 'carrier site' tiles.")]
+    [SerializeField] private MapTileData siteCarrierTileData;
 
     [Header("Config")]
     [Tooltip("Expected map size in tiles. Used to pre-create RenderTextures before map loads.")]
     [SerializeField] private Vector2Int defaultMapSize = new Vector2Int(24, 24);
-    [Tooltip("Pixels per tile. resolutionScale=4 gives 4×4 pixels per tile for sub-tile precision.")]
-    [SerializeField] private int resolutionScale = 4;
-    [Tooltip("First item ID in the semantic map. Must match item_id_offset in semantic_map_config.json.")]
-    [SerializeField] private int itemIdOffset = 6;
+    [Tooltip("Pixels per tile. 1 = exact tile grid (no sub-tile precision).")]
+    [SerializeField] private int resolutionScale = 1;
 
-    // Semantic IDs — must match semantic_map_config.json
-    private const byte ID_EMPTY = 0;
-    private const byte ID_WALL = 1;
-    private const byte ID_ALLY_STORAGE = 2;
-    private const byte ID_ENEMY_STORAGE = 3;
-    private const byte ID_ALLY_UNIT = 4;
-    private const byte ID_ENEMY_UNIT = 5;
+    // ===== Bit layout (must match Python MyObsPreprocessor) =====
+    private const int BATTERY_SHIFT = 3;
+    private const int BATTERY_BITS = 4;
+    private const int BATTERY_MAX = (1 << BATTERY_BITS) - 1; // 15 — real MaxItemAmount (10) fits with headroom; excess still saturates.
+    private const int ITEM_SHIFT = BATTERY_SHIFT + BATTERY_BITS; // 7
+
+    /// <summary>Divisor used to normalize the packed ushort into a float for the ML-Agents observation writer.</summary>
+    public const float PACK_DIVISOR = 1024f;
+
+    // Base tile category IDs — must match MyObsPreprocessor's channel layout.
+    private const ushort ID_VOID          = 0;
+    private const ushort ID_WALL          = 1;
+    private const ushort ID_SITE_HUNTER   = 2;
+    private const ushort ID_SITE_CARRIER  = 3;
+    private const ushort ID_SPAWN_ALLY    = 4;
+    private const ushort ID_SPAWN_ENEMY   = 5;
+    private const ushort ID_STORAGE_ALLY  = 6;
+    private const ushort ID_STORAGE_ENEMY = 7;
 
     /// <summary>RenderTexture for Team A agents (Team A = ally).</summary>
     public RenderTexture RenderTextureTeamA { get; private set; }
@@ -43,10 +74,10 @@ public class SemanticMapRenderer : MonoBehaviour
 
     private Texture2D textureA;
     private Texture2D textureB;
-    private byte[] pixelsA;
-    private byte[] pixelsB;
-    private byte[] backgroundA;
-    private byte[] backgroundB;
+    private ushort[] pixelsA;
+    private ushort[] pixelsB;
+    private ushort[] backgroundA;
+    private ushort[] backgroundB;
     private int texWidth;
     private int texHeight;
     private bool isInitialized;
@@ -76,7 +107,7 @@ public class SemanticMapRenderer : MonoBehaviour
     // ===== Per-step render (called from BlackOutEpisodeCoordinator.FixedUpdate) =====
 
     /// <summary>
-    /// Renders the current game state into both team RenderTextures.
+    /// Overlays ground items onto the cached static background and blits into both team RenderTextures.
     /// Call once per FixedUpdate, after game logic has run.
     /// </summary>
     public void Render()
@@ -84,39 +115,32 @@ public class SemanticMapRenderer : MonoBehaviour
         if (!isInitialized) return;
 
         MapManager mapManager = gameScenario.MapManager;
-        MatchManager matchManager = gameScenario.MatchManager;
-        TeamData teamA = matchManager.TeamA;
         Vector2 mapOrigin = mapManager.MapOriginWorld;
 
         // Start from pre-computed tile background
         System.Array.Copy(backgroundA, pixelsA, pixelsA.Length);
         System.Array.Copy(backgroundB, pixelsB, pixelsB.Length);
 
-        // Overlay ground items
+        // Overlay ground items (identical for both team perspectives — items aren't team-relative)
         foreach (ItemObject item in gameScenario.LevelDirector.ActiveItems)
         {
             if (item.State != ItemObject.ItemState.OnGround) continue;
             int idx = GetItemIndex(item.ItemData);
             if (idx < 0) continue;
-            byte id = (byte)(itemIdOffset + idx);
-            WritePixel(pixelsA, item.GlobalPos, mapOrigin, id);
-            WritePixel(pixelsB, item.GlobalPos, mapOrigin, id);
+
+            ushort bits = idx == 0
+                ? (ushort)(Mathf.Clamp(item.ItemAmount, 0, BATTERY_MAX) << BATTERY_SHIFT) // battery: stack count
+                : (ushort)(idx << ITEM_SHIFT);                                            // other items: type index
+
+            WriteItemBits(pixelsA, item.GlobalPos, mapOrigin, bits);
+            WriteItemBits(pixelsB, item.GlobalPos, mapOrigin, bits);
         }
 
-        // Overlay units (written last → highest priority)
-        foreach (Unit unit in matchManager.Units)
-        {
-            if (!unit.gameObject.activeInHierarchy) continue;
-            bool isTeamAUnit = unit.Team == teamA;
-            WritePixel(pixelsA, unit.GlobalPos, mapOrigin, isTeamAUnit ? ID_ALLY_UNIT : ID_ENEMY_UNIT);
-            WritePixel(pixelsB, unit.GlobalPos, mapOrigin, isTeamAUnit ? ID_ENEMY_UNIT : ID_ALLY_UNIT);
-        }
-
-        textureA.LoadRawTextureData(pixelsA);
+        textureA.SetPixelData(pixelsA, 0);
         textureA.Apply(false);
         Graphics.Blit(textureA, RenderTextureTeamA);
 
-        textureB.LoadRawTextureData(pixelsB);
+        textureB.SetPixelData(pixelsB, 0);
         textureB.Apply(false);
         Graphics.Blit(textureB, RenderTextureTeamB);
     }
@@ -147,26 +171,25 @@ public class SemanticMapRenderer : MonoBehaviour
         RenderTextureTeamA?.Release();
         RenderTextureTeamB?.Release();
 
-        // sRGB RT: ML-Agents' RenderTextureSensor reads via ReadPixels into an sRGB Texture2D.
-        // Using a linear RT causes the read to apply linear→sRGB gamma encoding, which corrupts
-        // small semantic ID values (e.g. wall id=1 → linear 0.004 → sRGB byte 46 → wrong channel).
-        // With sRGB RT + sRGB source texture, the blit is a round-trip (sRGB→linear→sRGB = identity)
-        // and ML-Agents receives id/255 directly, which round-trips correctly in preprocess_graphic.
-        RenderTextureTeamA = new RenderTexture(texWidth, texHeight, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-        RenderTextureTeamB = new RenderTexture(texWidth, texHeight, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        // R16: single-channel, non-color format. No sRGB/gamma conversion is ever applied to it,
+        // so the packed integer value survives the RT round-trip exactly.
+        RenderTextureTeamA = new RenderTexture(texWidth, texHeight, 0, RenderTextureFormat.R16, RenderTextureReadWrite.Linear);
+        RenderTextureTeamB = new RenderTexture(texWidth, texHeight, 0, RenderTextureFormat.R16, RenderTextureReadWrite.Linear);
+        RenderTextureTeamA.filterMode = FilterMode.Point;
+        RenderTextureTeamB.filterMode = FilterMode.Point;
         RenderTextureTeamA.Create();
         RenderTextureTeamB.Create();
         ClearRT(RenderTextureTeamA);
         ClearRT(RenderTextureTeamB);
 
-        // sRGB source: R=G=B=semantic_id. Blit to sRGB RT is a lossless round-trip.
-        // Grayscale formula: 0.299*R + 0.587*G + 0.114*B = id/255 when R=G=B.
-        textureA = new Texture2D(texWidth, texHeight, TextureFormat.RGB24, false, false);
-        textureB = new Texture2D(texWidth, texHeight, TextureFormat.RGB24, false, false);
-        pixelsA = new byte[texWidth * texHeight * 3];
-        pixelsB = new byte[texWidth * texHeight * 3];
-        backgroundA = new byte[texWidth * texHeight * 3];
-        backgroundB = new byte[texWidth * texHeight * 3];
+        // Point filtering is required: bilinear filtering would blend adjacent tiles' packed
+        // integer values into meaningless fractions.
+        textureA = new Texture2D(texWidth, texHeight, TextureFormat.R16, false, true) { filterMode = FilterMode.Point };
+        textureB = new Texture2D(texWidth, texHeight, TextureFormat.R16, false, true) { filterMode = FilterMode.Point };
+        pixelsA = new ushort[texWidth * texHeight];
+        pixelsB = new ushort[texWidth * texHeight];
+        backgroundA = new ushort[texWidth * texHeight];
+        backgroundB = new ushort[texWidth * texHeight];
     }
 
     private static void ClearRT(RenderTexture rt)
@@ -178,7 +201,7 @@ public class SemanticMapRenderer : MonoBehaviour
     }
 
     /// <summary>
-    /// Pre-renders the static tile layer (wall / storage / empty) for both team perspectives.
+    /// Pre-renders the static base-category layer (bits 0-2) for both team perspectives.
     /// Called once per episode after the map is generated.
     /// </summary>
     private void RenderBackground()
@@ -187,6 +210,8 @@ public class SemanticMapRenderer : MonoBehaviour
         MatchManager matchManager = gameScenario.MatchManager;
         TeamData teamA = matchManager.TeamA;
         Vector2 mapOrigin = mapManager.MapOriginWorld;
+        Vector2Int spawnA = mapManager.MapSpaceInfo.TeamASpawnPoint;
+        Vector2Int spawnB = mapManager.MapSpaceInfo.TeamBSpawnPoint;
 
         for (int py = 0; py < texHeight; py++)
         {
@@ -197,7 +222,7 @@ public class SemanticMapRenderer : MonoBehaviour
                 Vector2Int cell = mapManager.WorldToCell(worldPos);
                 MapTile tile = mapManager.GetTile(cell);
 
-                byte idA, idB;
+                ushort idA, idB;
                 if (tile == null || tile.TileData.TileCollisionOption == TileCollisionOption.BlockAll)
                 {
                     idA = idB = ID_WALL;
@@ -205,34 +230,46 @@ public class SemanticMapRenderer : MonoBehaviour
                 else if (tile.OwnedRegion is Storage)
                 {
                     bool isTeamAStorage = tile.OwnedRegion.OwnedTeam == teamA;
-                    idA = isTeamAStorage ? ID_ALLY_STORAGE : ID_ENEMY_STORAGE;
-                    idB = isTeamAStorage ? ID_ENEMY_STORAGE : ID_ALLY_STORAGE;
+                    idA = isTeamAStorage ? ID_STORAGE_ALLY : ID_STORAGE_ENEMY;
+                    idB = isTeamAStorage ? ID_STORAGE_ENEMY : ID_STORAGE_ALLY;
+                }
+                else if (tile.TileData == siteHunterTileData)
+                {
+                    idA = idB = ID_SITE_HUNTER;
+                }
+                else if (tile.TileData == siteCarrierTileData)
+                {
+                    idA = idB = ID_SITE_CARRIER;
+                }
+                else if (cell == spawnA)
+                {
+                    idA = ID_SPAWN_ALLY;
+                    idB = ID_SPAWN_ENEMY;
+                }
+                else if (cell == spawnB)
+                {
+                    idA = ID_SPAWN_ENEMY;
+                    idB = ID_SPAWN_ALLY;
                 }
                 else
                 {
-                    idA = idB = ID_EMPTY;
+                    idA = idB = ID_VOID;
                 }
 
-                int byteIdx = (py * texWidth + px) * 3;
-                backgroundA[byteIdx]     = idA; // R
-                backgroundA[byteIdx + 1] = idA; // G
-                backgroundA[byteIdx + 2] = idA; // B
-                backgroundB[byteIdx]     = idB;
-                backgroundB[byteIdx + 1] = idB;
-                backgroundB[byteIdx + 2] = idB;
+                int idx = py * texWidth + px;
+                backgroundA[idx] = idA;
+                backgroundB[idx] = idB;
             }
         }
     }
 
-    private void WritePixel(byte[] pixels, Vector2 worldPos, Vector2 mapOrigin, byte id)
+    private void WriteItemBits(ushort[] pixels, Vector2 worldPos, Vector2 mapOrigin, ushort bits)
     {
         int px = Mathf.FloorToInt((worldPos.x - mapOrigin.x) * resolutionScale);
         int py = Mathf.FloorToInt((worldPos.y - mapOrigin.y) * resolutionScale);
         if (px < 0 || px >= texWidth || py < 0 || py >= texHeight) return;
-        int byteIdx = (py * texWidth + px) * 3;
-        pixels[byteIdx]     = id; // R
-        pixels[byteIdx + 1] = id; // G
-        pixels[byteIdx + 2] = id; // B
+        int idx = py * texWidth + px;
+        pixels[idx] |= bits; // safe: base bits (0-2) never overlap item bits (3-8)
     }
 
     private int GetItemIndex(ItemData itemData)

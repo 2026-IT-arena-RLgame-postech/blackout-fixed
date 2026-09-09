@@ -954,9 +954,10 @@ MonoBehaviour:
   - {fileID: 11400000, guid: c9f8b8e0d8ce79f46868af6ae8df6a6b, type: 2}
   - {fileID: 11400000, guid: a1fe15f0f6cce4544aae91bcd25a2517, type: 2}
   - {fileID: 11400000, guid: 5f0f8d8363b3581408072ce93548e31b, type: 2}
+  siteHunterTileData: {fileID: 11400000, guid: 98d4890824fd5794b9dda2c23947a38e, type: 2}
+  siteCarrierTileData: {fileID: 11400000, guid: ba8f7d9b552ccb547bee90d130f0183c, type: 2}
   defaultMapSize: {x: 24, y: 24}
-  resolutionScale: 4
-  itemIdOffset: 6
+  resolutionScale: 1
 --- !u!114 &115036440
 MonoBehaviour:
   m_ObjectHideFlags: 0

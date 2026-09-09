@@ -65,7 +65,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         // Must create RenderTextures before agent.Setup() so RenderTextureSensorComponent
         // can reference them during Agent.OnEnable() → InitializeSensors().
         semanticMapRenderer.CreateTextures();
-        mapObsAgent?.Setup(semanticMapRenderer.RenderTextureTeamA);
+        mapObsAgent?.Setup(semanticMapRenderer.RenderTextureTeamA, this, gameScenario);
 
         _seedChannel = new SeedChannel();
         SideChannelManager.RegisterSideChannel(_seedChannel);
@@ -77,6 +77,11 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
 
         semanticMapRenderer.SubscribeEvents(gameScenario.EventBus);
         gameScenario.EventBus.Flow.OnGameEnded += OnGameEnded;
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // Debug-only reward overlay (F9 to toggle). Self-attached — no scene wiring needed.
+        gameObject.AddComponent<RewardDebugUI>().Initialize(agents);
+#endif
     }
 
     private void Start()
@@ -136,6 +141,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
             Unit unit = mm.Units[agent.UnitIndex];
             float reward = winner == null ? 0f : winner == unit.Team ? 1f : -1f;
             agent.AddReward(reward);
+            RewardEventLog.Record(agent.UnitIndex, winner == null ? "DRAW" : reward > 0f ? "WIN" : "LOSE", reward);
             agent.EndEpisode();
         }
     }
