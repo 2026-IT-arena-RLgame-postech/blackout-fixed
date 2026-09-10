@@ -84,7 +84,11 @@ public class MapObsAgent : Agent
 
         foreach (Unit u in matchManager.Units)
         {
-            sensor.AddObservation((u.GlobalPos - mapOrigin) / bounds);
+            // Normalized to [-1, 1] (not [0, 1]) so position is zero-centered like the other
+            // per-unit fields (team sign is already +-1); Python passes this through as-is
+            // (see MyObsPreprocessor.preprocess_agent_states), so this is the only place the
+            // scale is defined.
+            sensor.AddObservation((u.GlobalPos - mapOrigin) / bounds * 2f - Vector2.one);
             int itemIdx = u.HoldingItem != null ? coordinator.GetItemIndex(u.HoldingItem.ItemData) : -1;
             float holdingItemId;
             if (itemIdx < 0)
