@@ -22,6 +22,13 @@ public class RewardConfig
     public float teamScoreReward = 0.1f;
     public float teamScorePenalty = 0.1f;
 
+    // Potential-based shaping (see reward_proposal.md §14). Phase 1: Ψ is a hand-designed
+    // function of state, not a learned model.
+    public float potentialEta = 0.25f;
+    public float potentialGamma = 0.99995f;
+    public float potentialScale = 40f;
+    public float hazardCoefficient = 0.05f;
+
     private Dictionary<string, float> _map;
 
     public float GetItemReward(string itemName, float fallback = 0.1f)

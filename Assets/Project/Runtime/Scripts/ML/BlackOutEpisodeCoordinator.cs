@@ -47,6 +47,8 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     private int episodeBeginCount;
     private SeedChannel _seedChannel;
     private RewardConfig rewardConfig;
+    private PotentialRewardCalculator potentialCalc;
+    private float prevPsiA;
 
     private void Awake()
     {
@@ -71,6 +73,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         SideChannelManager.RegisterSideChannel(_seedChannel);
 
         rewardConfig = RewardConfig.Load();
+        potentialCalc = new PotentialRewardCalculator(gameScenario, rewardConfig);
 
         foreach (var agent in agents)
             agent.Setup(this, gameScenario, rewardConfig);
@@ -86,13 +89,14 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
 
     private void Start()
     {
-        gameScenario.EpisodeBegin();
+        BeginEpisode();
     }
 
     private void FixedUpdate()
     {
         gameScenario.EpisodeUpdate(Time.fixedDeltaTime);
         semanticMapRenderer.Render();
+        ApplyPotentialShaping();
     }
 
     /// <summary>
@@ -105,7 +109,42 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         if (episodeBeginCount >= agents.Length)
         {
             episodeBeginCount = 0;
-            gameScenario.EpisodeBegin();
+            BeginEpisode();
+        }
+    }
+
+    /// <summary>
+    /// Starts a new game episode and resets potential-shaping state so the previous episode's
+    /// Ψ never leaks into the new one (reward_proposal.md Scenario 22).
+    /// </summary>
+    private void BeginEpisode()
+    {
+        gameScenario.EpisodeBegin();
+        potentialCalc.OnEpisodeBegin();
+        prevPsiA = potentialCalc.ComputePotential(gameScenario.MatchManager.TeamA);
+    }
+
+    /// <summary>
+    /// Adds potential-based shaping reward for this tick: η[γΨ(s') - Ψ(s)], split by sign
+    /// between the two teams (Ψ_B = -Ψ_A always, so this is exactly zero-sum) and broadcast
+    /// undivided to all 5 agents on each team, matching the existing kill/death/item reward
+    /// convention (see reward_proposal.md §14.2).
+    /// </summary>
+    private void ApplyPotentialShaping()
+    {
+        if (gameScenario.CurrentState != GameState.Playing) return;
+
+        MatchManager mm = gameScenario.MatchManager;
+        float newPsiA = potentialCalc.ComputePotential(mm.TeamA);
+        float shapedA = rewardConfig.potentialEta * (rewardConfig.potentialGamma * newPsiA - prevPsiA);
+        prevPsiA = newPsiA;
+
+        foreach (var agent in agents)
+        {
+            Unit unit = mm.Units[agent.UnitIndex];
+            float r = unit.Team == mm.TeamA ? shapedA : -shapedA;
+            agent.AddReward(r);
+            RewardEventLog.Record(agent.UnitIndex, "potential-shaping", r);
         }
     }
 

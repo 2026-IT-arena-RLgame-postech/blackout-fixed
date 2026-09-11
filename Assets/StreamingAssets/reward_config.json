@@ -1,10 +1,14 @@
 {
     "itemRewards": [
-        { "itemName": "Battery", "value": 0.2 },
-        { "itemName": "SpeedBuff", "value": 0.1 }
+        { "itemName": "Battery", "value": 0.0 },
+        { "itemName": "SpeedBuff", "value": 0.0 }
     ],
-    "killReward": 0.3,
-    "deathPenalty": 0.2,
-    "teamScoreReward": 0.1,
-    "teamScorePenalty": 0.1
+    "killReward": 0.0,
+    "deathPenalty": 0.0,
+    "teamScoreReward": 0.0,
+    "teamScorePenalty": 0.0,
+    "potentialEta": 0.25,
+    "potentialGamma": 0.99995,
+    "potentialScale": 40.0,
+    "hazardCoefficient": 0.05
 }

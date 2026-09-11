@@ -21,6 +21,9 @@ public class MapManager : MonoBehaviour, IMapInteractionContext
     /// </summary>
     public MapSpaceInfo MapSpaceInfo => mapData?.MapSpaceInfo;
 
+    /// <summary>All map regions (Default/Sanctuary/Storage) generated for the current map.</summary>
+    public IReadOnlyList<MapRegion> Regions => mapData?.MapRegions ?? Array.Empty<MapRegion>();
+
     /// <summary>Width of the current map in tiles.</summary>
     public int MapWidth => mapData?.Width ?? 0;
 
