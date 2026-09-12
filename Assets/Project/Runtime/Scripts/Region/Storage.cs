@@ -104,6 +104,13 @@ public class Storage : MapRegion
         bool tileFilled = false;
         foreach (var change in plan)
         {
+            // UpdateAmount/OnDropped can synchronously publish score events.  A winning
+            // deposit then resets the scenario while this precomputed plan is still being
+            // executed, destroying its ItemObjects.  Unity's main thread is not concurrent,
+            // but this callback re-entrancy invalidates the remaining references exactly like
+            // a transaction conflict.  The match is already over, so stop applying the stale
+            // tail instead of dereferencing a destroyed object.
+            if (incomingItem == null || change.TargetTile == null) return;
             if (change.IsNewItem)
             {
                 if (tileFilled) Debug.LogError("More than 1 tiles are filled.");
@@ -114,6 +121,7 @@ public class Storage : MapRegion
             else
             {
                 ItemObject existingItem = change.TargetTile.MapObjects.Find(x => x is ItemObject) as ItemObject;
+                if (existingItem == null) return;
                 existingItem.UpdateAmount(existingItem.ItemAmount + change.AmountToAdd);
             }
         }
