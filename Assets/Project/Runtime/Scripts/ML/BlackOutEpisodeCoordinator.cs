@@ -57,12 +57,16 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         // Allow Unity to run in background (required for standalone training builds).
         Application.runInBackground = true;
 
-        // Cap to exactly 1 FixedUpdate per gRPC frame.
-        // - Prevents FixedUpdate catch-up spiral (slow Python → flood → timeout).
-        // - Prevents terminal/decision race at high time_scale: if game ends in FU1 and a
-        //   new episode starts in FU2 of the same frame, Python only sees the decision obs
-        //   and never receives the terminal signal → episode never terminates.
-        Time.maximumDeltaTime = Time.fixedDeltaTime;
+        // Bound FixedUpdate catch-up per rendered frame so a stalled Python trainer can't
+        // spiral (each tick blocks on a gRPC round-trip). This used to be clamped to exactly
+        // Time.fixedDeltaTime (1 tick/frame) to also stop a terminal/decision race — a new
+        // episode's first decision silently overwriting the previous episode's terminal
+        // signal when both landed in the same Academy step — but that made Time.timeScale
+        // unable to speed up training (timeScale works by letting several ticks run per
+        // rendered frame). The race is now prevented directly in BlackOutAgent, which
+        // suppresses its own RequestDecision() for one tick right after OnEpisodeBegin, so
+        // this only needs to guard against runaway catch-up, not single-step it.
+        Time.maximumDeltaTime = Time.fixedDeltaTime * 50f;
 
         gameScenario.Initialize();
 

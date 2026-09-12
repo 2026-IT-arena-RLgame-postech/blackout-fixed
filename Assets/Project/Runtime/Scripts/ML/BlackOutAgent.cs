@@ -22,6 +22,20 @@ public class BlackOutAgent : Agent
 
     [SerializeField] private int unitIndex; // 0-4: Team A, 5-9: Team B
 
+    [Tooltip("Request a fresh decision every N FixedUpdate ticks; the previous action is " +
+        "repeated on skipped ticks (replaces the DecisionRequester component, which this " +
+        "class's own RequestDecision() call already made a no-op).")]
+    [SerializeField] private int decisionPeriod = 2;
+
+    private int ticksUntilDecision;
+
+    // Set by OnEpisodeBegin so the FixedUpdate right after an episode ends skips
+    // RequestDecision(). EndEpisode() already sent this tick's terminal AgentInfo
+    // synchronously (Agent.NotifyAgentDone); requesting another decision on the same tick
+    // would overwrite that terminal info in the brain's per-agent buffer before it ever
+    // reaches Python, silently dropping the "done" signal for this episode.
+    private bool suppressDecisionThisTick;
+
     private BlackOutEpisodeCoordinator coordinator;
     private GameScenario gameScenario;
     private MatchManager matchManager;
@@ -144,6 +158,8 @@ public class BlackOutAgent : Agent
     /// </summary>
     public override void OnEpisodeBegin()
     {
+        suppressDecisionThisTick = true;
+        ticksUntilDecision = 0;
         coordinator?.NotifyAgentEpisodeBegin();
     }
 
@@ -161,7 +177,22 @@ public class BlackOutAgent : Agent
 
     private void FixedUpdate()
     {
-        RequestDecision();
+        if (suppressDecisionThisTick)
+        {
+            suppressDecisionThisTick = false;
+            return;
+        }
+
+        if (ticksUntilDecision <= 0)
+        {
+            ticksUntilDecision = decisionPeriod - 1;
+            RequestDecision();
+        }
+        else
+        {
+            ticksUntilDecision--;
+            RequestAction();
+        }
     }
 
     public override void OnActionReceived(ActionBuffers actions)
