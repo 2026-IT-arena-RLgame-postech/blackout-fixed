@@ -14,9 +14,11 @@ public class PotentialRewardCalculator
     private readonly RewardConfig config;
 
     // Per-team reachable-tile sets, computed once per episode via BFS flood fill from each
-    // team's spawn using IsWalkable as the traversal predicate. This answers "can this team
-    // physically reach this tile" (protected-storage detection) — it is NOT full pathfinding
-    // (no distances/times); see reward_proposal.md §14.1 (no pathfinding infra exists yet).
+    // team's spawn using IsWalkable as the traversal predicate. This answers only "can this
+    // team physically reach this tile at all" (protected-storage detection) — a plain boolean
+    // full-connectivity precompute, deliberately kept separate from the per-query grid path
+    // distances in GridPathfinder (used below for hazard) since it only needs to run once per
+    // episode rather than once per battery per tick.
     private readonly Dictionary<TeamData, HashSet<MapTile>> reachableTiles = new();
     private bool connectivityBuilt;
 
@@ -92,7 +94,8 @@ public class PotentialRewardCalculator
     /// Estimated probability that <paramref name="custodyTeam"/> still holds this item at the
     /// next absorption tick. 1.0 if the item sits on a tile the opposing team cannot physically
     /// reach (protected storage); otherwise an exp(-hazard * time-remaining) falloff using
-    /// straight-line distance to the nearest enemy unit as a hazard proxy.
+    /// grid path distance (see <see cref="GridPathfinder"/>) to the nearest enemy unit as a
+    /// hazard proxy.
     /// </summary>
     private float SurvivalProbability(ItemObject item, TeamData custodyTeam)
     {
@@ -107,16 +110,49 @@ public class PotentialRewardCalculator
         return Mathf.Exp(-hazard * tau);
     }
 
+    /// <summary>
+    /// Grid path distance (world units) from <paramref name="pos"/> to the nearest unit of
+    /// <paramref name="enemy"/>, walked as that team would (its own IsWalkable), instead of the
+    /// straight-line approximation reward_proposal.md §14.1/§14.3 flagged as a known gap. This
+    /// answers "how far does the enemy actually have to travel", so a wall between the item and
+    /// the enemy correctly lowers hazard even when the enemy happens to be close in a straight
+    /// line. Falls back to a large sentinel if no enemy exists or none can reach this cell at
+    /// all (e.g. sealed off by its own team's protected-storage walls).
+    /// </summary>
     private float NearestEnemyDistance(Vector2 pos, TeamData enemy)
     {
-        float best = float.MaxValue;
+        MapManager mapManager = scenario.MapManager;
+        Vector2Int startCell = mapManager.WorldToCell(pos);
+
+        var enemyCells = new HashSet<Vector2Int>();
         foreach (Unit unit in scenario.MatchManager.Units)
+            if (unit.Team == enemy)
+                enemyCells.Add(mapManager.WorldToCell(unit.GlobalPos));
+        if (enemyCells.Count == 0) return 999f;
+
+        float? cells = GridPathfinder.NearestMatchingDistance(
+            startCell,
+            cell => mapManager.IsWalkable(cell, enemy),
+            enemyCells.Contains);
+
+        return cells.HasValue ? cells.Value * TileWorldSize() : 999f;
+    }
+
+    private float? cachedTileWorldSize;
+
+    /// <summary>World-unit distance between adjacent tile centers, so grid-step distances from
+    /// <see cref="GridPathfinder"/> stay in the same units the existing hazard/potential-scale
+    /// hyperparameters were chosen against (no straight-line-vs-path-unit mismatch to retune).</summary>
+    private float TileWorldSize()
+    {
+        if (!cachedTileWorldSize.HasValue)
         {
-            if (unit.Team != enemy) continue;
-            float d = Vector2.Distance(pos, unit.GlobalPos);
-            if (d < best) best = d;
+            MapManager mapManager = scenario.MapManager;
+            cachedTileWorldSize = Vector2.Distance(
+                mapManager.CellToCenterWorld(Vector2Int.zero),
+                mapManager.CellToCenterWorld(Vector2Int.right));
         }
-        return best == float.MaxValue ? 999f : best;
+        return cachedTileWorldSize.Value;
     }
 
     private bool IsReachableBy(MapTile tile, TeamData team)
@@ -143,8 +179,12 @@ public class PotentialRewardCalculator
 
     /// <summary>
     /// BFS flood fill from <paramref name="team"/>'s spawn using IsWalkable(pos, team) as the
-    /// traversal predicate. Reachability only (no distances) — a minimal stand-in until real
-    /// pathfinding exists (reward_proposal.md §14.1/§14.3).
+    /// traversal predicate. Orthogonal-only 4-connectivity here still yields the exact same
+    /// reachable set as GridPathfinder's corner-respecting 8-directional search below (a
+    /// diagonal step is only ever allowed when both flanking orthogonal cells are already
+    /// walkable, so it never reaches a cell 4-connectivity couldn't also reach — it only ever
+    /// shortens the path). Kept as its own plain BFS because this only needs a yes/no
+    /// reachability answer, computed once per episode, not a per-query distance.
     /// </summary>
     private void BuildReachabilitySet(TeamData team, Vector2Int spawn)
     {
