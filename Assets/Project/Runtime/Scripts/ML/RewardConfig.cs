@@ -17,10 +17,16 @@ public class RewardConfig
     }
 
     public ItemRewardEntry[] itemRewards = Array.Empty<ItemRewardEntry>();
-    public float killReward = 0.3f;
-    public float deathPenalty = 0.2f;
-    public float teamScoreReward = 0.1f;
-    public float teamScorePenalty = 0.1f;
+
+    // Fixed event rewards default to 0 (reward_proposal.md §12): all strategic value is meant
+    // to come from potential-based shaping (Ψ_k, Φ_i) instead. These fields only exist so a
+    // reward_config.json override can still re-enable them for ablation experiments; the
+    // class defaults themselves must stay 0 so a missing/corrupt config file (see Load()
+    // below) can never silently reintroduce fixed rewards the design forbids.
+    public float killReward = 0f;
+    public float deathPenalty = 0f;
+    public float teamScoreReward = 0f;
+    public float teamScorePenalty = 0f;
 
     // Potential-based shaping (see reward_proposal.md §14). Phase 1: Ψ is a hand-designed
     // function of state, not a learned model.
@@ -37,7 +43,7 @@ public class RewardConfig
 
     private Dictionary<string, float> _map;
 
-    public float GetItemReward(string itemName, float fallback = 0.1f)
+    public float GetItemReward(string itemName, float fallback = 0f)
     {
         if (_map == null) BuildMap();
         return _map.TryGetValue(itemName, out float v) ? v : fallback;
@@ -56,7 +62,9 @@ public class RewardConfig
         string path = System.IO.Path.Combine(Application.streamingAssetsPath, "reward_config.json");
         if (!System.IO.File.Exists(path))
         {
-            Debug.LogWarning($"[RewardConfig] {path} not found. Using defaults.");
+            Debug.LogError($"[RewardConfig] {path} not found. Falling back to class defaults " +
+                            "(all fixed event rewards 0, shaping hyperparameters at their Phase 1/1.5 " +
+                            "design values) — verify StreamingAssets was packaged with this build.");
             return new RewardConfig();
         }
         RewardConfig config = JsonUtility.FromJson<RewardConfig>(System.IO.File.ReadAllText(path));
