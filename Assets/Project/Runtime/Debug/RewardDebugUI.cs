@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.InputSystem;
 
 /// <summary>
 /// Runtime debug overlay: per-unit cumulative reward this episode, team totals, and a
@@ -24,7 +25,7 @@ public class RewardDebugUI : MonoBehaviour
 
     private void Update()
     {
-        if (Input.GetKeyDown(KeyCode.F9))
+        if (Keyboard.current != null && Keyboard.current.f9Key.wasPressedThisFrame)
             visible = !visible;
     }
 
