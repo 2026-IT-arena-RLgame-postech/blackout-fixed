@@ -51,9 +51,15 @@ public class TimerManager
 
     public void Tick(float dt)
     {
-        for (int i = timers.Count - 1; i >= 0; i--)
+        // Snapshot before ticking: a timer's OnComplete can synchronously end the episode
+        // and rebuild this same list (Clear() + AddTimer() for the next episode) before this
+        // loop returns. Iterating live indices into a list mutated underneath us would remove
+        // whatever now sits at that index — one of the newly-added next-episode timers —
+        // instead of the timer that actually just completed, silently orphaning it.
+        var snapshot = timers.ToArray();
+        foreach (var timer in snapshot)
         {
-            if (timers[i].Tick(dt)) timers.RemoveAt(i);
+            if (timer.Tick(dt)) timers.Remove(timer);
         }
     }
 
