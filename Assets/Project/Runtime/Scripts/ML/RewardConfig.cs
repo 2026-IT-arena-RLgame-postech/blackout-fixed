@@ -29,6 +29,12 @@ public class RewardConfig
     public float potentialScale = 40f;
     public float hazardCoefficient = 0.05f;
 
+    // Individual navigation potential shaping — Phase 1.5 (see reward_proposal.md §15).
+    // Fills the "unclaimed field item contributes 0 to Ψ" gap with a per-agent, non-zero-sum
+    // proximity signal. Reuses potentialGamma for γ (see §15.3 — no separate discount added).
+    public float navPotentialEta = 0.08f;
+    public float navPotentialScale = 12f;
+
     private Dictionary<string, float> _map;
 
     public float GetItemReward(string itemName, float fallback = 0.1f)

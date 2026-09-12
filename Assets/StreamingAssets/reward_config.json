@@ -10,5 +10,7 @@
     "potentialEta": 0.25,
     "potentialGamma": 0.99995,
     "potentialScale": 40.0,
-    "hazardCoefficient": 0.05
+    "hazardCoefficient": 0.05,
+    "navPotentialEta": 0.08,
+    "navPotentialScale": 12.0
 }

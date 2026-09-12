@@ -49,6 +49,8 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     private RewardConfig rewardConfig;
     private PotentialRewardCalculator potentialCalc;
     private float prevPsiA;
+    private IndividualNavPotentialCalculator navPotentialCalc;
+    private float[] prevPhi;
 
     private void Awake()
     {
@@ -74,6 +76,8 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
 
         rewardConfig = RewardConfig.Load();
         potentialCalc = new PotentialRewardCalculator(gameScenario, rewardConfig);
+        navPotentialCalc = new IndividualNavPotentialCalculator(gameScenario, rewardConfig);
+        prevPhi = new float[agents.Length];
 
         foreach (var agent in agents)
             agent.Setup(this, gameScenario, rewardConfig);
@@ -97,6 +101,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         gameScenario.EpisodeUpdate(Time.fixedDeltaTime);
         semanticMapRenderer.Render();
         ApplyPotentialShaping();
+        ApplyNavShaping();
     }
 
     /// <summary>
@@ -122,6 +127,10 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         gameScenario.EpisodeBegin();
         potentialCalc.OnEpisodeBegin();
         prevPsiA = potentialCalc.ComputePotential(gameScenario.MatchManager.TeamA);
+
+        MatchManager mm = gameScenario.MatchManager;
+        foreach (var agent in agents)
+            prevPhi[agent.UnitIndex] = navPotentialCalc.ComputePotential(mm.Units[agent.UnitIndex]);
     }
 
     /// <summary>
@@ -145,6 +154,29 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
             float r = unit.Team == mm.TeamA ? shapedA : -shapedA;
             agent.AddReward(r);
             RewardEventLog.Record(agent.UnitIndex, "potential-shaping", r);
+        }
+    }
+
+    /// <summary>
+    /// Adds individual navigation-potential shaping for this tick: η_nav[γΦ_i(s') - Φ_i(s)],
+    /// per unit, credited only to that unit's own agent (not team-broadcast — unlike
+    /// <see cref="ApplyPotentialShaping"/>, this is not required to be zero-sum between teams;
+    /// see reward_proposal.md §15).
+    /// </summary>
+    private void ApplyNavShaping()
+    {
+        if (gameScenario.CurrentState != GameState.Playing) return;
+
+        MatchManager mm = gameScenario.MatchManager;
+        foreach (var agent in agents)
+        {
+            Unit unit = mm.Units[agent.UnitIndex];
+            float newPhi = navPotentialCalc.ComputePotential(unit);
+            float r = rewardConfig.navPotentialEta * (rewardConfig.potentialGamma * newPhi - prevPhi[agent.UnitIndex]);
+            prevPhi[agent.UnitIndex] = newPhi;
+
+            agent.AddReward(r);
+            RewardEventLog.Record(agent.UnitIndex, "nav-shaping", r);
         }
     }
 
