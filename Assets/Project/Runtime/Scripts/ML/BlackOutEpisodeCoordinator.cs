@@ -69,7 +69,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         // Must create RenderTextures before agent.Setup() so RenderTextureSensorComponent
         // can reference them during Agent.OnEnable() → InitializeSensors().
         semanticMapRenderer.CreateTextures();
-        mapObsAgent?.Setup(semanticMapRenderer.RenderTextureTeamA, this, gameScenario);
+        mapObsAgent?.Setup(semanticMapRenderer, this, gameScenario);
 
         _seedChannel = new SeedChannel();
         SideChannelManager.RegisterSideChannel(_seedChannel);

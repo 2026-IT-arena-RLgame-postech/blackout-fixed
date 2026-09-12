@@ -56,9 +56,9 @@ public class MapObsAgent : Agent
     /// shared unit-state table. Safe to call before or after InitializeSensors —
     /// DynamicRTSensorComponent handles both orderings internally.
     /// </summary>
-    public void Setup(RenderTexture teamATexture, BlackOutEpisodeCoordinator episodeCoordinator, GameScenario scenario)
+    public void Setup(SemanticMapRenderer semanticRenderer, BlackOutEpisodeCoordinator episodeCoordinator, GameScenario scenario)
     {
-        _sensorComp.SetRenderTexture(teamATexture);
+        _sensorComp.SetSource(semanticRenderer);
         coordinator = episodeCoordinator;
         gameScenario = scenario;
         matchManager = scenario.MatchManager;
@@ -118,34 +118,33 @@ public class MapObsAgent : Agent
 /// </summary>
 public class DynamicRTSensorComponent : SensorComponent
 {
-    private RenderTexture _pendingTexture;
+    private SemanticMapRenderer _pendingSource;
     private DynamicRTSensor _sensor;
 
-    public void SetRenderTexture(RenderTexture rt)
+    public void SetSource(SemanticMapRenderer source)
     {
-        _pendingTexture = rt;
-        _sensor?.SetRenderTexture(rt);
+        _pendingSource = source;
+        _sensor?.SetSource(source);
     }
 
     public override ISensor[] CreateSensors()
     {
         _sensor = new DynamicRTSensor("TeamAMap");
-        if (_pendingTexture != null)
-            _sensor.SetRenderTexture(_pendingTexture);
+        if (_pendingSource != null)
+            _sensor.SetSource(_pendingSource);
         return new ISensor[] { _sensor };
     }
 }
 
 /// <summary>
-/// Visual sensor that reads from a RenderTexture assigned at runtime.
-/// The RT reference can be updated after sensor creation via SetRenderTexture().
-/// Reads the raw ushort pixel value directly (R16, no GetPixels32) to avoid any
-/// 8-bit quantization or color-space conversion of the bit-packed semantic value.
+/// Visual-shaped sensor that writes SemanticMapRenderer's CPU-side packed ushort map.
+/// It deliberately avoids a RenderTexture readback: headless/NullGfx R16 ReadPixels can
+/// return invalid constant data, and a GPU round-trip is unnecessary because the renderer
+/// already owns the exact CPU array.
 /// </summary>
 internal class DynamicRTSensor : ISensor
 {
-    private RenderTexture _rt;
-    private Texture2D _readBuffer;
+    private SemanticMapRenderer _source;
     private readonly string _name;
 
     // Dimensions used for the ObservationSpec — updated when RT is first assigned.
@@ -162,25 +161,16 @@ internal class DynamicRTSensor : ISensor
         _spec = ObservationSpec.Visual(1, _height, _width);
     }
 
-    internal void SetRenderTexture(RenderTexture rt)
+    internal void SetSource(SemanticMapRenderer source)
     {
-        _rt = rt;
-        if (rt == null) return;
+        _source = source;
+        if (source == null) return;
 
-        if (_width != rt.width || _height != rt.height)
+        if (_width != source.TextureWidth || _height != source.TextureHeight)
         {
-            _width = rt.width;
-            _height = rt.height;
+            _width = source.TextureWidth;
+            _height = source.TextureHeight;
             _spec = ObservationSpec.Visual(1, _height, _width);
-
-            if (_readBuffer != null)
-                Object.Destroy(_readBuffer);
-            // R16: single-channel, non-color, linear. Matches SemanticMapRenderer's RT format
-            // exactly, so ReadPixels is a straight bit copy — no conversion, no gamma.
-            _readBuffer = new Texture2D(_width, _height, TextureFormat.R16, false, true)
-            {
-                filterMode = FilterMode.Point
-            };
         }
     }
 
@@ -193,16 +183,8 @@ internal class DynamicRTSensor : ISensor
 
     public int Write(ObservationWriter writer)
     {
-        if (_rt == null || _readBuffer == null) return 0;
-
-        // Read the RT into a CPU-side Texture2D (same R16 format on both sides — exact copy).
-        var prev = RenderTexture.active;
-        RenderTexture.active = _rt;
-        _readBuffer.ReadPixels(new Rect(0, 0, _width, _height), 0, 0, false);
-        _readBuffer.Apply(false);
-        RenderTexture.active = prev;
-
-        var pixels = _readBuffer.GetPixelData<ushort>(0);
+        ushort[] pixels = _source?.TeamAPixels;
+        if (pixels == null || pixels.Length != _width * _height) return 0;
 
         // Texture2D stores rows bottom-up; ObservationWriter expects top-down.
         // Normalize the packed value into [0,1] for the ML-Agents float observation channel;

@@ -71,6 +71,10 @@ public class SemanticMapRenderer : MonoBehaviour
     public RenderTexture RenderTextureTeamA { get; private set; }
     /// <summary>RenderTexture for Team B agents (Team B = ally).</summary>
     public RenderTexture RenderTextureTeamB { get; private set; }
+    /// <summary>CPU-side Team A packed pixels used by the headless ML sensor.</summary>
+    public ushort[] TeamAPixels => pixelsA;
+    public int TextureWidth => texWidth;
+    public int TextureHeight => texHeight;
 
     private Texture2D textureA;
     private Texture2D textureB;
@@ -138,11 +142,16 @@ public class SemanticMapRenderer : MonoBehaviour
 
         textureA.SetPixelData(pixelsA, 0);
         textureA.Apply(false);
-        Graphics.Blit(textureA, RenderTextureTeamA);
+        // Both surfaces are identically-sized R16 textures containing packed integers.
+        // Graphics.Blit goes through a colour-sampling shader; on Metal that conversion can
+        // saturate every non-zero ushort to 65535, destroying all semantic bits.  CopyTexture
+        // is a raw GPU copy and therefore preserves the exact packed value consumed by
+        // DynamicRTSensor.
+        Graphics.CopyTexture(textureA, RenderTextureTeamA);
 
         textureB.SetPixelData(pixelsB, 0);
         textureB.Apply(false);
-        Graphics.Blit(textureB, RenderTextureTeamB);
+        Graphics.CopyTexture(textureB, RenderTextureTeamB);
     }
 
     // ===== Private helpers =====

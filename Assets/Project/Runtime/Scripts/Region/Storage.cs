@@ -38,6 +38,10 @@ public class Storage : MapRegion
         if (shouldRelease)
         {
             ItemObject item = unit.RetrieveItem();
+            // Depositing can synchronously reach TargetScore, end the episode, and reset the
+            // unit before TryDistributeItem returns.  In that terminal race ResetState has
+            // already destroyed/cleared HoldingItem, so there is nothing left to publish.
+            if (item == null) return;
             ItemData depositedItemData = item.ItemData;
             if (shouldDestory)
                 item.OnDestroyed();
