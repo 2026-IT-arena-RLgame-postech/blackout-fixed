@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using Unity.MLAgents.Policies;
 using UnityEditor;
 using UnityEditor.Build.Reporting;
 using UnityEditor.SceneManagement;
@@ -164,12 +165,73 @@ public static class ArenaDuplicator
             clone.transform.position = arena0.transform.position + new Vector3(spacing * i, 0f, 0f);
         }
 
+        // Every arena -- including Arena_0, the un-cloned original -- needs arenaIndex set:
+        // BlackOutUnit/BlackOutMap in different arenas share one BehaviorName each, and every
+        // agent under one BehaviorName must agree on VectorObservationSize, so Arena_0 can't be
+        // left at the legacy 1-/44-float shape while Arena_1+ use 2/45. See BlackOutAgent's
+        // arenaIndex doc comment for why this is still a no-op for Prototype.unity itself
+        // (which this method never opens).
+        GameObject[] postCloneRoots = scene.GetRootGameObjects();
+        for (int i = 0; i < count; i++)
+        {
+            GameObject arenaRoot = postCloneRoots.First(r => r.name == $"Arena_{i}");
+            ConfigureArenaIndex(arenaRoot, i);
+        }
+
         EditorSceneManager.MarkSceneDirty(scene);
         bool saved = EditorSceneManager.SaveScene(scene);
         if (!saved)
             throw new IOException($"EditorSceneManager.SaveScene failed for {MultiArenaScenePath}");
 
         Debug.Log($"[ArenaDuplicator] generated {MultiArenaScenePath} with {count} arena(s), spacing={spacing}");
+    }
+
+    /// <summary>
+    /// Sets arenaIndex on every BlackOutAgent/MapObsAgent under arenaRoot and bumps that
+    /// component's declared VectorObservationSize by 1 to match the extra float those classes
+    /// then emit (see their CollectObservations overrides).
+    ///
+    /// Goes through SerializedObject/SerializedProperty rather than plain C# field mutation --
+    /// Unit is a PrefabInstance (see Unit.prefab), and a direct field write there does NOT
+    /// reliably persist as a scene override once EditorSceneManager.SaveScene runs (verified the
+    /// hard way, including with an explicit PrefabUtility.RecordPrefabInstancePropertyModifications
+    /// call, which alone did not fix it in batchmode): Arena_0's original, non-Instantiate()'d
+    /// Unit instances silently kept arenaIndex=-1 while every Instantiate()-cloned arena's copies
+    /// picked it up fine, producing a VectorObservationSize/actual-obs-count mismatch ML-Agents
+    /// only caught at runtime ("Expected shape (2,) but got (1,)"). SerializedObject is the same
+    /// mechanism the Inspector GUI itself uses to edit a prefab instance, so it reliably reaches
+    /// the same overrides-list regardless of the reason plain field writes didn't.
+    /// </summary>
+    static void ConfigureArenaIndex(GameObject arenaRoot, int index)
+    {
+        foreach (var agent in arenaRoot.GetComponentsInChildren<BlackOutAgent>(includeInactive: true))
+        {
+            SetIntProperty(agent, "arenaIndex", index);
+            BumpVectorObservationSize(agent.GetComponent<BehaviorParameters>());
+        }
+        foreach (var mapAgent in arenaRoot.GetComponentsInChildren<MapObsAgent>(includeInactive: true))
+        {
+            SetIntProperty(mapAgent, "arenaIndex", index);
+            BumpVectorObservationSize(mapAgent.GetComponent<BehaviorParameters>());
+        }
+    }
+
+    static void BumpVectorObservationSize(BehaviorParameters bp)
+    {
+        if (bp == null)
+            throw new Exception("expected a BehaviorParameters component alongside BlackOutAgent/MapObsAgent");
+        int current = new SerializedObject(bp).FindProperty("m_BrainParameters.VectorObservationSize").intValue;
+        SetIntProperty(bp, "m_BrainParameters.VectorObservationSize", current + 1);
+    }
+
+    static void SetIntProperty(Component c, string propertyPath, int value)
+    {
+        var so = new SerializedObject(c);
+        SerializedProperty prop = so.FindProperty(propertyPath);
+        if (prop == null)
+            throw new Exception($"property '{propertyPath}' not found on {c.GetType().Name} (GameObject '{c.gameObject.name}')");
+        prop.intValue = value;
+        so.ApplyModifiedProperties();
     }
 
     static void BuildMultiArenaPlayer()

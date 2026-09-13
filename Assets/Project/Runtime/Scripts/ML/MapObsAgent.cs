@@ -35,6 +35,14 @@ public class MapObsAgent : Agent
     private const int ScalarCount = 4;
     private const int RawStateSize = NUnits * UnitBlockSize + ScalarCount;
 
+    // See BlackOutAgent.arenaIndex's doc comment -- same convention: -1 (default, single-arena)
+    // emits nothing extra so Prototype.unity is unaffected; a multi-arena scene sets this on
+    // every MapObsAgent, appending 1 float so Python can group each arena's broadcast state.
+    [SerializeField] private int arenaIndex = -1;
+
+    /// <summary>Set by ArenaDuplicator when generating a multi-arena scene.</summary>
+    public void SetArenaIndex(int index) => arenaIndex = index;
+
     private void Awake()
     {
         // Remove any stale RenderTextureSensorComponent to prevent duplicate sensors.
@@ -76,6 +84,8 @@ public class MapObsAgent : Agent
         if (matchManager == null)
         {
             for (int i = 0; i < RawStateSize; i++) sensor.AddObservation(0f);
+            if (arenaIndex >= 0)
+                sensor.AddObservation((float)arenaIndex);
             return;
         }
 
@@ -106,6 +116,9 @@ public class MapObsAgent : Agent
         sensor.AddObservation(matchManager.GetTeamContext(matchManager.TeamB).Score / targetScore);
         sensor.AddObservation(gameScenario.EpisodeTimer != null ? 1f - gameScenario.EpisodeTimer.Ratio : 1f);
         sensor.AddObservation(gameScenario.AbsorptionTimer != null ? 1f - gameScenario.AbsorptionTimer.Ratio : 1f);
+
+        if (arenaIndex >= 0)
+            sensor.AddObservation((float)arenaIndex);
     }
 
     public override void OnActionReceived(ActionBuffers actions) { }
