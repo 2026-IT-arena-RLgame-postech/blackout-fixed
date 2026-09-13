@@ -46,6 +46,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
 
     private int episodeBeginCount;
     private SeedChannel _seedChannel;
+    private bool _ownsSeedChannelRegistration;
     private RewardConfig rewardConfig;
     private PotentialRewardCalculator potentialCalc;
     private float prevPsiA;
@@ -75,8 +76,11 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         semanticMapRenderer.CreateTextures();
         mapObsAgent?.Setup(semanticMapRenderer, this, gameScenario);
 
+        // Multi-arena scenes have one BlackOutEpisodeCoordinator per arena, but seeding is
+        // process-global (one UnityEngine.Random) -- only the first coordinator actually
+        // registers a SeedChannel; see SeedChannel's doc comment.
         _seedChannel = new SeedChannel();
-        SideChannelManager.RegisterSideChannel(_seedChannel);
+        _ownsSeedChannelRegistration = SeedChannel.TryRegister(_seedChannel);
 
         rewardConfig = RewardConfig.Load();
         potentialCalc = new PotentialRewardCalculator(gameScenario, rewardConfig);
@@ -226,7 +230,6 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         if (gameScenario?.EventBus != null)
             gameScenario.EventBus.Flow.OnGameEnded -= OnGameEnded;
 
-        if (_seedChannel != null)
-            SideChannelManager.UnregisterSideChannel(_seedChannel);
+        SeedChannel.TryUnregister(_seedChannel, _ownsSeedChannelRegistration);
     }
 }
