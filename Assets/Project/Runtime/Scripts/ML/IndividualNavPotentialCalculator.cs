@@ -10,10 +10,10 @@ using UnityEngine;
 /// sub-goal: a ground battery while empty-handed, or the nearest own-team storage tile that can
 /// accept its held battery while carrying.
 ///
-/// Distances are grid path distances (<see cref="GridPathfinder"/>), walked as this unit's own
-/// team, rather than straight-line — §15.2/§15.7 flagged straight-line as a known approximation
-/// gap since a wall between a unit and its nearest item in a straight line previously understated
-/// how far away that item actually was.
+/// Distances are grid path distances (same move set and no-corner-cutting rule as
+/// <see cref="GridPathfinder"/>), walked as this unit's own team, rather than straight-line —
+/// §15.2/§15.7 flagged straight-line as a known approximation gap since a wall between a unit and
+/// its nearest item in a straight line previously understated how far away that item actually was.
 ///
 /// 2026-09-12: the empty-handed potential folds in the candidate item's own distance to storage,
 /// so potential doesn't jump upward right as a unit reaches an item as if the delivery were already
@@ -33,12 +33,27 @@ using UnityEngine;
 ///   - Φ is scaled by the battery's amount / MaxItemAmount, both while fetching and while carrying,
 ///     so pickup still leaves Φ unchanged (same item, same distance, same weight);
 ///   - each battery is claimed by at most one teammate: (unit, battery) pairs are assigned greedily
-///     by that weighted potential, highest first, ties by unit index then cell. A unit left without
-///     a battery gets Φ = 0 and is free to do something other than fetch.
+///     by that weighted potential, highest first, ties by unit index then cell x, then y. A unit
+///     left without a battery gets Φ = 0 and is free to do something other than fetch.
 /// Φ is still a deterministic function of the current state, so the shaping stays potential-based.
+///
+/// This runs every physics tick for all units, so the searches are allocation-free: per-team
+/// walkability is cached for the episode (tile collision options and region ownership are fixed
+/// once a map is built), each search reuses preallocated grid arrays and heap, and each (team,
+/// battery type) storage distance field is computed once per call and shared by carriers and
+/// fetchers. A first version built a Dictionary per search and called MapManager.IsWalkable per
+/// neighbor, which tripled Unity CPU per decision during dataset collection.
 /// </summary>
 public class IndividualNavPotentialCalculator
 {
+    private const float Sqrt2 = 1.41421356f;
+
+    private static readonly (int dx, int dy, float cost)[] Moves =
+    {
+        (1, 0, 1f), (-1, 0, 1f), (0, 1, 1f), (0, -1, 1f),
+        (1, 1, Sqrt2), (1, -1, Sqrt2), (-1, 1, Sqrt2), (-1, -1, Sqrt2),
+    };
+
     private readonly GameScenario scenario;
     private readonly RewardConfig config;
 
@@ -50,14 +65,55 @@ public class IndividualNavPotentialCalculator
 
     private float? cachedTileWorldSize;
 
+    // ---- Per-episode grid cache ----
+    private MapSpaceInfo cachedSpace;
+    private int gridWidth, gridHeight;
+    private Vector2Int gridOrigin;
+    private readonly Dictionary<TeamData, bool[]> walkableByTeam = new();
+
+    // ---- Reusable search buffers ----
+    private float[] scratchField;
+    private int[] targetStamp;
+    private int currentTargetStamp;
+    private readonly List<(float key, int cell)> heap = new();
+    private readonly Dictionary<(TeamData, ItemData), float[]> storageFieldPool = new();
+    private readonly HashSet<(TeamData, ItemData)> storageFieldsFresh = new();
+    private readonly List<int> sourceCells = new();
+
+    // ---- Reusable per-call assignment buffers ----
+    private readonly Dictionary<TeamData, List<int>> fetchersByTeam = new();
+    private readonly List<(int cell, ItemObject item)> batteries = new();
+    private readonly List<(float value, int unitIndex, int cell)> candidates = new();
+    private readonly HashSet<int> assignedUnits = new();
+    private readonly HashSet<int> claimedCells = new();
+    private readonly Comparison<(float value, int unitIndex, int cell)> candidateOrder;
+
     public IndividualNavPotentialCalculator(GameScenario scenario, RewardConfig config)
     {
         this.scenario = scenario;
         this.config = config;
+        // Highest value first; ties by unit index, then cell x, then cell y.
+        candidateOrder = (a, b) =>
+        {
+            int byValue = b.value.CompareTo(a.value);
+            if (byValue != 0) return byValue;
+            int byUnit = a.unitIndex.CompareTo(b.unitIndex);
+            if (byUnit != 0) return byUnit;
+            int ax = a.cell % gridWidth, bx = b.cell % gridWidth;
+            return ax != bx ? ax.CompareTo(bx) : (a.cell / gridWidth).CompareTo(b.cell / gridWidth);
+        };
     }
 
-    /// <summary>World-unit distance between adjacent tile centers, so GridPathfinder's grid-step
-    /// distances stay in the same units navPotentialScale was tuned against.</summary>
+    /// <summary>Drops the per-episode walkability cache. Call once at the start of every episode,
+    /// after the map for that episode exists.</summary>
+    public void OnEpisodeBegin()
+    {
+        cachedSpace = null;
+        walkableByTeam.Clear();
+    }
+
+    /// <summary>World-unit distance between adjacent tile centers, so grid-step distances stay in
+    /// the same units navPotentialScale was tuned against.</summary>
     private float TileWorldSize()
     {
         if (!cachedTileWorldSize.HasValue)
@@ -77,9 +133,11 @@ public class IndividualNavPotentialCalculator
     /// </summary>
     public float[] ComputePotentials(IReadOnlyList<Unit> units)
     {
-        var phi = new float[units.Count];
-        var fetchersByTeam = new Dictionary<TeamData, List<int>>();
+        EnsureGrid();
+        storageFieldsFresh.Clear();
+        foreach (List<int> list in fetchersByTeam.Values) list.Clear();
 
+        var phi = new float[units.Count];
         for (int i = 0; i < units.Count; i++)
         {
             Unit unit = units[i];
@@ -89,7 +147,12 @@ public class IndividualNavPotentialCalculator
             {
                 float weight = BatteryWeight(unit.HoldingItem);
                 if (weight > 0f)
-                    phi[i] = weight * Saturate(NearestOwnStorageTileDistance(unit));
+                {
+                    float[] toStorage = StorageField(unit.Team, unit.HoldingItem.ItemData);
+                    float cells = CellValue(toStorage, CellIndex(unit.GlobalPos));
+                    float distance = float.IsPositiveInfinity(cells) ? NoTargetDistance() : cells * TileWorldSize();
+                    phi[i] = weight * Saturate(distance);
+                }
                 continue;
             }
 
@@ -99,7 +162,8 @@ public class IndividualNavPotentialCalculator
         }
 
         foreach (var (team, fetchers) in fetchersByTeam)
-            AssignFetchTargets(team, fetchers, units, phi);
+            if (fetchers.Count > 0)
+                AssignFetchTargets(team, fetchers, units, phi);
         return phi;
     }
 
@@ -127,8 +191,7 @@ public class IndividualNavPotentialCalculator
     /// </summary>
     private void AssignFetchTargets(TeamData team, List<int> fetchers, IReadOnlyList<Unit> units, float[] phi)
     {
-        MapManager mapManager = scenario.MapManager;
-        var batteries = new Dictionary<Vector2Int, ItemObject>();
+        batteries.Clear();
         foreach (ItemObject item in scenario.LevelDirector.ActiveItems)
         {
             if (item.State != ItemObject.ItemState.OnGround) continue;
@@ -136,47 +199,49 @@ public class IndividualNavPotentialCalculator
             if (!item.IsInteractable(team)) continue;
             if (BatteryWeight(item) <= 0f) continue;
 
-            batteries[mapManager.WorldToCell(item.GlobalPos)] = item;
+            int cell = CellIndex(item.GlobalPos);
+            if (cell < 0) continue;
+            // One item per cell, last one wins -- same as the previous per-cell dictionary.
+            int existing = -1;
+            for (int b = 0; b < batteries.Count; b++)
+                if (batteries[b].cell == cell) { existing = b; break; }
+            if (existing >= 0) batteries[existing] = (cell, item);
+            else batteries.Add((cell, item));
         }
         if (batteries.Count == 0) return;
 
-        Func<Vector2Int, bool> walkable = cell => mapManager.IsWalkable(cell, team);
+        bool[] walkable = WalkableFor(team);
         float tile = TileWorldSize();
-        // One flood per battery type out of every accepting storage tile, shared by all batteries
-        // of that type (moves are symmetric, so it gives each cell's distance to storage).
-        var storageFields = new Dictionary<ItemData, Dictionary<Vector2Int, float>>();
+        candidates.Clear();
 
-        var candidates = new List<(float value, int unitIndex, Vector2Int cell)>();
         foreach (int unitIndex in fetchers)
         {
-            Vector2Int startCell = mapManager.WorldToCell(units[unitIndex].GlobalPos);
-            Dictionary<Vector2Int, float> fromUnit = GridPathfinder.DistanceField(new[] { startCell }, walkable);
+            int start = CellIndex(units[unitIndex].GlobalPos);
+            if (start < 0) continue;
+
+            currentTargetStamp++;
+            foreach (var (cell, _) in batteries) targetStamp[cell] = currentTargetStamp;
+            sourceCells.Clear();
+            sourceCells.Add(start);
+            Flood(sourceCells, walkable, scratchField, batteries.Count);
 
             foreach (var (cell, item) in batteries)
             {
-                if (!fromUnit.TryGetValue(cell, out float fetchCells)) continue;
-
-                if (!storageFields.TryGetValue(item.ItemData, out Dictionary<Vector2Int, float> toStorage))
-                    storageFields[item.ItemData] = toStorage = GridPathfinder.DistanceField(AcceptingStorageCells(team, item.ItemData), walkable);
+                float fetchCells = scratchField[cell];
+                if (float.IsPositiveInfinity(fetchCells)) continue;
 
                 float distance = fetchCells * tile;
-                if (toStorage.TryGetValue(cell, out float storageCells))
+                float storageCells = StorageField(team, item.ItemData)[cell];
+                if (!float.IsPositiveInfinity(storageCells))
                     distance += storageCells * tile;
                 candidates.Add((BatteryWeight(item) * Saturate(distance), unitIndex, cell));
             }
         }
 
-        candidates.Sort((x, y) =>
-        {
-            int byValue = y.value.CompareTo(x.value);
-            if (byValue != 0) return byValue;
-            int byUnit = x.unitIndex.CompareTo(y.unitIndex);
-            if (byUnit != 0) return byUnit;
-            return x.cell.x != y.cell.x ? x.cell.x.CompareTo(y.cell.x) : x.cell.y.CompareTo(y.cell.y);
-        });
+        candidates.Sort(candidateOrder);
 
-        var assignedUnits = new HashSet<int>();
-        var claimedCells = new HashSet<Vector2Int>();
+        assignedUnits.Clear();
+        claimedCells.Clear();
         foreach (var (value, unitIndex, cell) in candidates)
         {
             if (assignedUnits.Contains(unitIndex) || claimedCells.Contains(cell)) continue;
@@ -186,38 +251,157 @@ public class IndividualNavPotentialCalculator
         }
     }
 
-    /// <summary>
-    /// Grid path distance to the nearest tile in a Storage region owned by this unit's team that
-    /// can currently accept the item the unit is carrying — empty, or holding the same item type
-    /// below its max stack amount (§15.2's S_i(s)).
-    /// </summary>
-    private float NearestOwnStorageTileDistance(Unit unit)
+    // ------------------------------------------------------------------
+    // Grid search
+    // ------------------------------------------------------------------
+
+    private void EnsureGrid()
     {
-        Vector2Int startCell = scenario.MapManager.WorldToCell(unit.GlobalPos);
-        HashSet<Vector2Int> targetCells = AcceptingStorageCells(unit.Team, unit.HoldingItem.ItemData);
-        if (targetCells.Count == 0) return NoTargetDistance();
-
         MapManager mapManager = scenario.MapManager;
-        float? cells = GridPathfinder.NearestMatchingDistance(
-            startCell,
-            cell => mapManager.IsWalkable(cell, unit.Team),
-            targetCells.Contains);
+        MapSpaceInfo space = mapManager.MapSpaceInfo;
+        if (space == cachedSpace && gridWidth == mapManager.MapWidth && gridHeight == mapManager.MapHeight) return;
 
-        return cells.HasValue ? cells.Value * TileWorldSize() : NoTargetDistance();
+        cachedSpace = space;
+        gridWidth = mapManager.MapWidth;
+        gridHeight = mapManager.MapHeight;
+        gridOrigin = space != null ? space.BottomLeft : Vector2Int.zero;
+        walkableByTeam.Clear();
+        storageFieldPool.Clear();
+
+        int n = gridWidth * gridHeight;
+        scratchField = new float[n];
+        targetStamp = new int[n];
+        currentTargetStamp = 0;
     }
 
-    private HashSet<Vector2Int> AcceptingStorageCells(TeamData team, ItemData heldData)
+    /// <summary>Grid index of a world position, or -1 outside the map.</summary>
+    private int CellIndex(Vector2 worldPos)
     {
-        var cells = new HashSet<Vector2Int>();
+        Vector2Int cell = scenario.MapManager.WorldToCell(worldPos);
+        int x = cell.x - gridOrigin.x, y = cell.y - gridOrigin.y;
+        if (x < 0 || y < 0 || x >= gridWidth || y >= gridHeight) return -1;
+        return x + y * gridWidth;
+    }
+
+    private static float CellValue(float[] field, int cell) => cell < 0 ? float.PositiveInfinity : field[cell];
+
+    private bool[] WalkableFor(TeamData team)
+    {
+        if (walkableByTeam.TryGetValue(team, out bool[] walkable)) return walkable;
+
+        MapManager mapManager = scenario.MapManager;
+        walkable = new bool[gridWidth * gridHeight];
+        for (int y = 0; y < gridHeight; y++)
+            for (int x = 0; x < gridWidth; x++)
+                walkable[x + y * gridWidth] = mapManager.IsWalkable(new Vector2Int(x + gridOrigin.x, y + gridOrigin.y), team);
+        walkableByTeam[team] = walkable;
+        return walkable;
+    }
+
+    /// <summary>Distance field (tile units, +inf where unreachable) from every storage tile of
+    /// <paramref name="team"/> that can currently accept <paramref name="heldData"/>. Moves are
+    /// symmetric, so a cell's value is also its distance to the nearest such tile. Built at most once
+    /// per ComputePotentials call.</summary>
+    private float[] StorageField(TeamData team, ItemData heldData)
+    {
+        var key = (team, heldData);
+        if (!storageFieldPool.TryGetValue(key, out float[] field))
+            storageFieldPool[key] = field = new float[gridWidth * gridHeight];
+        if (storageFieldsFresh.Contains(key)) return field;
+
+        sourceCells.Clear();
         foreach (MapRegion region in scenario.MapManager.Regions)
         {
             if (region is not Storage storage || storage.OwnedTeam != team) continue;
 
             foreach (MapTile tile in storage.MapTiles)
-                if (CanAccept(tile, heldData))
-                    cells.Add(tile.CellPos);
+            {
+                if (!CanAccept(tile, heldData)) continue;
+                int x = tile.CellPos.x - gridOrigin.x, y = tile.CellPos.y - gridOrigin.y;
+                if (x >= 0 && y >= 0 && x < gridWidth && y < gridHeight)
+                    sourceCells.Add(x + y * gridWidth);
+            }
         }
-        return cells;
+        Flood(sourceCells, WalkableFor(team), field, 0);
+        storageFieldsFresh.Add(key);
+        return field;
+    }
+
+    /// <summary>
+    /// Dijkstra from <paramref name="sources"/> over <paramref name="walkable"/> cells into
+    /// <paramref name="field"/> (+inf where unreached). A diagonal step needs both flanking
+    /// orthogonal cells walkable. With <paramref name="stopAfterTargets"/> &gt; 0, stops once that
+    /// many cells marked with the current target stamp are settled; their values are final, other
+    /// cells may be left partial.
+    /// </summary>
+    private void Flood(List<int> sources, bool[] walkable, float[] field, int stopAfterTargets)
+    {
+        Array.Fill(field, float.PositiveInfinity);
+        heap.Clear();
+        foreach (int source in sources)
+        {
+            if (field[source] == 0f) continue;
+            field[source] = 0f;
+            HeapPush(0f, source);
+        }
+
+        int settledTargets = 0;
+        while (heap.Count > 0)
+        {
+            (float dist, int cell) = HeapPop();
+            if (dist > field[cell]) continue;
+            if (stopAfterTargets > 0 && targetStamp[cell] == currentTargetStamp && ++settledTargets >= stopAfterTargets)
+                return;
+
+            int cx = cell % gridWidth, cy = cell / gridWidth;
+            foreach (var (dx, dy, cost) in Moves)
+            {
+                int nx = cx + dx, ny = cy + dy;
+                if (nx < 0 || ny < 0 || nx >= gridWidth || ny >= gridHeight) continue;
+                int next = nx + ny * gridWidth;
+                if (!walkable[next]) continue;
+                if (dx != 0 && dy != 0 && (!walkable[nx + cy * gridWidth] || !walkable[cx + ny * gridWidth]))
+                    continue;
+
+                float nd = dist + cost;
+                if (field[next] <= nd) continue;
+                field[next] = nd;
+                HeapPush(nd, next);
+            }
+        }
+    }
+
+    private void HeapPush(float key, int cell)
+    {
+        heap.Add((key, cell));
+        int i = heap.Count - 1;
+        while (i > 0)
+        {
+            int parent = (i - 1) / 2;
+            if (heap[parent].key <= heap[i].key) break;
+            (heap[parent], heap[i]) = (heap[i], heap[parent]);
+            i = parent;
+        }
+    }
+
+    private (float key, int cell) HeapPop()
+    {
+        var root = heap[0];
+        int last = heap.Count - 1;
+        heap[0] = heap[last];
+        heap.RemoveAt(last);
+
+        int i = 0;
+        while (true)
+        {
+            int left = 2 * i + 1, right = 2 * i + 2, smallest = i;
+            if (left < heap.Count && heap[left].key < heap[smallest].key) smallest = left;
+            if (right < heap.Count && heap[right].key < heap[smallest].key) smallest = right;
+            if (smallest == i) break;
+            (heap[smallest], heap[i]) = (heap[i], heap[smallest]);
+            i = smallest;
+        }
+        return root;
     }
 
     private static bool CanAccept(MapTile tile, ItemData heldData)

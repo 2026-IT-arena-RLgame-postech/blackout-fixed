@@ -134,6 +134,7 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     {
         gameScenario.EpisodeBegin();
         potentialCalc.OnEpisodeBegin();
+        navPotentialCalc.OnEpisodeBegin();
         prevPsiA = potentialCalc.ComputePotential(gameScenario.MatchManager.TeamA);
 
         float[] phi = navPotentialCalc.ComputePotentials(gameScenario.MatchManager.Units);
