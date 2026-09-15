@@ -87,6 +87,51 @@ public static class GridPathfinder
         return null;
     }
 
+    /// <summary>
+    /// Shortest walkable-grid distance, in tile units, from the nearest of
+    /// <paramref name="sources"/> to every cell reachable from them (same move/corner rules as
+    /// <see cref="NearestMatching"/>). Moves are symmetric, so this is also each cell's distance
+    /// TO the nearest source — one flood out of every storage tile answers "how far is storage from
+    /// here" for all candidate items at once, instead of one search per item.
+    /// </summary>
+    public static Dictionary<Vector2Int, float> DistanceField(
+        IEnumerable<Vector2Int> sources,
+        Func<Vector2Int, bool> isWalkable,
+        int maxVisited = 4096)
+    {
+        var best = new Dictionary<Vector2Int, float>();
+        var heap = new MinHeap();
+        foreach (Vector2Int source in sources)
+        {
+            if (best.ContainsKey(source)) continue;
+            best[source] = 0f;
+            heap.Push(0f, source);
+        }
+        int visited = 0;
+
+        while (heap.Count > 0 && visited < maxVisited)
+        {
+            (float dist, Vector2Int cell) = heap.Pop();
+            if (dist > best[cell]) continue;
+            visited++;
+
+            foreach (var (dx, dy, cost) in Moves)
+            {
+                var next = new Vector2Int(cell.x + dx, cell.y + dy);
+                if (!isWalkable(next)) continue;
+                if (dx != 0 && dy != 0 &&
+                    (!isWalkable(new Vector2Int(cell.x + dx, cell.y)) || !isWalkable(new Vector2Int(cell.x, cell.y + dy))))
+                    continue;
+
+                float nd = dist + cost;
+                if (best.TryGetValue(next, out float existing) && existing <= nd) continue;
+                best[next] = nd;
+                heap.Push(nd, next);
+            }
+        }
+        return best;
+    }
+
     /// <summary>Minimal binary min-heap keyed by float priority. Avoids depending on
     /// System.Collections.Generic.PriorityQueue, whose availability varies with Unity's
     /// configured API compatibility level.</summary>

@@ -87,7 +87,7 @@ public class PotentialRewardCalculator
         }
     }
 
-    private static bool IsScoringBattery(ItemData data) =>
+    internal static bool IsScoringBattery(ItemData data) =>
         data != null && data.Effects != null && data.Effects.Any(e => e is ScoreItemEffect);
 
     /// <summary>

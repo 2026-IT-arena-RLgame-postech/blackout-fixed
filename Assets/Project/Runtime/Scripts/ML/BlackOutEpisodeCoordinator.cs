@@ -136,9 +136,9 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         potentialCalc.OnEpisodeBegin();
         prevPsiA = potentialCalc.ComputePotential(gameScenario.MatchManager.TeamA);
 
-        MatchManager mm = gameScenario.MatchManager;
+        float[] phi = navPotentialCalc.ComputePotentials(gameScenario.MatchManager.Units);
         foreach (var agent in agents)
-            prevPhi[agent.UnitIndex] = navPotentialCalc.ComputePotential(mm.Units[agent.UnitIndex]);
+            prevPhi[agent.UnitIndex] = phi[agent.UnitIndex];
     }
 
     /// <summary>
@@ -175,11 +175,10 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     {
         if (gameScenario.CurrentState != GameState.Playing) return;
 
-        MatchManager mm = gameScenario.MatchManager;
+        float[] phi = navPotentialCalc.ComputePotentials(gameScenario.MatchManager.Units);
         foreach (var agent in agents)
         {
-            Unit unit = mm.Units[agent.UnitIndex];
-            float newPhi = navPotentialCalc.ComputePotential(unit);
+            float newPhi = phi[agent.UnitIndex];
             float r = rewardConfig.navPotentialEta * (rewardConfig.potentialGamma * newPhi - prevPhi[agent.UnitIndex]);
             prevPhi[agent.UnitIndex] = newPhi;
 
