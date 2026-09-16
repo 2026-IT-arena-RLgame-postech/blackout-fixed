@@ -37,6 +37,20 @@ using UnityEngine;
 ///     left without a battery gets Φ = 0 and is free to do something other than fetch.
 /// Φ is still a deterministic function of the current state, so the shaping stays potential-based.
 ///
+/// 2026-09-16: units that cannot collect but can kill (Hunters) get a pursuit potential. They were
+/// skipped entirely before, so a Collector that transformed lost its only dense signal: Ψ moves
+/// only when a carrier actually dies, every direction looked the same to the value function, and
+/// the Run 8 model's Hunters oscillated in place (blackout-env docs/offline_pretrain_runs.md).
+///   - targets are enemy units this unit beats that do not beat it back (Hunter.asset beats
+///     Collector and Carrier; a mutual kill, were one ever configured, is not a pull);
+///   - weight = hunterPotentialBaseWeight + (1 - base) * the target's held-battery weight, so a
+///     loaded carrier -- whose death Ψ already values -- is the strongest pull, and an empty-handed
+///     unit is still worth closing on;
+///   - Φ = weight * Saturate(grid path distance), assigned greedily per team with each enemy
+///     claimed by at most one Hunter, the same rule as fetch targets.
+/// A kill still drops Φ (the target respawns at its base), exactly like a deposit does for a
+/// carrier: shaping telescopes, so approach-then-kill nets zero and the kill's value comes from Ψ.
+///
 /// This runs every physics tick for all units, so the searches are allocation-free: per-team
 /// walkability is cached for the episode (tile collision options and region ownership are fixed
 /// once a map is built), each search reuses preallocated grid arrays and heap, and each (team,
@@ -82,11 +96,14 @@ public class IndividualNavPotentialCalculator
 
     // ---- Reusable per-call assignment buffers ----
     private readonly Dictionary<TeamData, List<int>> fetchersByTeam = new();
+    private readonly Dictionary<TeamData, List<int>> huntersByTeam = new();
+    private readonly List<(int cell, int unitIndex, float weight)> preyUnits = new();
     private readonly List<(int cell, ItemObject item)> batteries = new();
     private readonly List<(float value, int unitIndex, int cell)> candidates = new();
     private readonly HashSet<int> assignedUnits = new();
     private readonly HashSet<int> claimedCells = new();
     private readonly Comparison<(float value, int unitIndex, int cell)> candidateOrder;
+    private readonly Comparison<(float value, int unitIndex, int cell)> huntOrder;
 
     public IndividualNavPotentialCalculator(GameScenario scenario, RewardConfig config)
     {
@@ -101,6 +118,14 @@ public class IndividualNavPotentialCalculator
             if (byUnit != 0) return byUnit;
             int ax = a.cell % gridWidth, bx = b.cell % gridWidth;
             return ax != bx ? ax.CompareTo(bx) : (a.cell / gridWidth).CompareTo(b.cell / gridWidth);
+        };
+        // Highest value first; ties by hunter index, then prey unit index.
+        huntOrder = (a, b) =>
+        {
+            int byValue = b.value.CompareTo(a.value);
+            if (byValue != 0) return byValue;
+            int byUnit = a.unitIndex.CompareTo(b.unitIndex);
+            return byUnit != 0 ? byUnit : a.cell.CompareTo(b.cell);
         };
     }
 
@@ -136,12 +161,20 @@ public class IndividualNavPotentialCalculator
         EnsureGrid();
         storageFieldsFresh.Clear();
         foreach (List<int> list in fetchersByTeam.Values) list.Clear();
+        foreach (List<int> list in huntersByTeam.Values) list.Clear();
 
         var phi = new float[units.Count];
         for (int i = 0; i < units.Count; i++)
         {
             Unit unit = units[i];
-            if (!unit.UnitData.Collectable) continue;
+            if (!unit.UnitData.Collectable)
+            {
+                if (unit.UnitData.Beats == null || unit.UnitData.Beats.Length == 0) continue;
+                if (!huntersByTeam.TryGetValue(unit.Team, out List<int> hunters))
+                    huntersByTeam[unit.Team] = hunters = new List<int>();
+                hunters.Add(i);
+                continue;
+            }
 
             if (unit.HoldingItem != null)
             {
@@ -164,7 +197,79 @@ public class IndividualNavPotentialCalculator
         foreach (var (team, fetchers) in fetchersByTeam)
             if (fetchers.Count > 0)
                 AssignFetchTargets(team, fetchers, units, phi);
+        foreach (var (team, hunters) in huntersByTeam)
+            if (hunters.Count > 0)
+                AssignHuntTargets(team, hunters, units, phi);
         return phi;
+    }
+
+    private static bool Beats(UnitData attacker, UnitData defender) =>
+        attacker.Beats != null && Array.IndexOf(attacker.Beats, defender) >= 0;
+
+    /// <summary>
+    /// Assigns each of <paramref name="team"/>'s Hunters at most one enemy it can kill without dying
+    /// (and each enemy at most one Hunter), greedily by weight * Saturate(grid path distance), and
+    /// writes that value into <paramref name="phi"/>. See the class summary for the weight.
+    /// </summary>
+    private void AssignHuntTargets(TeamData team, List<int> hunters, IReadOnlyList<Unit> units, float[] phi)
+    {
+        bool[] walkable = WalkableFor(team);
+        float tile = TileWorldSize();
+        float baseWeight = Mathf.Clamp01(config.hunterPotentialBaseWeight);
+        candidates.Clear();
+
+        foreach (int hunterIndex in hunters)
+        {
+            Unit hunter = units[hunterIndex];
+            int start = CellIndex(hunter.GlobalPos);
+            if (start < 0) continue;
+
+            preyUnits.Clear();
+            currentTargetStamp++;
+            int distinctCells = 0;
+            for (int j = 0; j < units.Count; j++)
+            {
+                Unit prey = units[j];
+                if (!team.IsOpponent(prey.Team)) continue;
+                if (!Beats(hunter.UnitData, prey.UnitData) || Beats(prey.UnitData, hunter.UnitData)) continue;
+                int cell = CellIndex(prey.GlobalPos);
+                if (cell < 0) continue;
+
+                float cargo = prey.HoldingItem != null ? BatteryWeight(prey.HoldingItem) : 0f;
+                preyUnits.Add((cell, j, baseWeight + (1f - baseWeight) * cargo));
+                if (targetStamp[cell] != currentTargetStamp)
+                {
+                    targetStamp[cell] = currentTargetStamp;
+                    distinctCells++;
+                }
+            }
+            if (preyUnits.Count == 0) continue;
+
+            sourceCells.Clear();
+            sourceCells.Add(start);
+            Flood(sourceCells, walkable, scratchField, distinctCells);
+
+            // candidates' third field holds the prey's unit index here, not a cell, so the claim
+            // set below is keyed by enemy unit.
+            foreach (var (cell, preyIndex, weight) in preyUnits)
+            {
+                float cells = scratchField[cell];
+                if (float.IsPositiveInfinity(cells)) continue;
+                candidates.Add((weight * Saturate(cells * tile), hunterIndex, preyIndex));
+            }
+        }
+
+        candidates.Sort(huntOrder);
+
+        assignedUnits.Clear();
+        claimedCells.Clear();
+        foreach (var (value, hunterIndex, preyIndex) in candidates)
+        {
+            if (assignedUnits.Contains(hunterIndex) || claimedCells.Contains(preyIndex)) continue;
+            phi[hunterIndex] = value;
+            assignedUnits.Add(hunterIndex);
+            claimedCells.Add(preyIndex);
+        }
     }
 
     private float Saturate(float distance) =>

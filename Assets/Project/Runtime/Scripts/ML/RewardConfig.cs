@@ -41,6 +41,10 @@ public class RewardConfig
     public float navPotentialEta = 0.08f;
     public float navPotentialScale = 12f;
 
+    // Hunter pursuit potential (IndividualNavPotentialCalculator, 2026-09-16): the pull toward an
+    // empty-handed enemy, as a fraction of the pull toward one carrying a full battery stack.
+    public float hunterPotentialBaseWeight = 0.25f;
+
     private Dictionary<string, float> _map;
 
     public float GetItemReward(string itemName, float fallback = 0f)
