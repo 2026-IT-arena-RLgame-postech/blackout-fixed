@@ -108,9 +108,14 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     {
         gameScenario.EpisodeUpdate(Time.fixedDeltaTime);
         semanticMapRenderer.Render();
-        ApplyPotentialShaping();
-        ApplyNavShaping();
+        if (PsiShapingOn) ApplyPotentialShaping();
+        if (NavShapingOn) ApplyNavShaping();
     }
+
+    // η = 0 makes a shaping term identically zero, so skip computing its potential (path searches
+    // over every unit and item each tick) instead of multiplying the result by 0.
+    private bool PsiShapingOn => rewardConfig.potentialEta != 0f;
+    private bool NavShapingOn => rewardConfig.navPotentialEta != 0f;
 
     /// <summary>
     /// Called by each <see cref="BlackOutAgent.OnEpisodeBegin"/>.
@@ -135,8 +140,10 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         gameScenario.EpisodeBegin();
         potentialCalc.OnEpisodeBegin();
         navPotentialCalc.OnEpisodeBegin();
-        prevPsiA = potentialCalc.ComputePotential(gameScenario.MatchManager.TeamA);
+        if (PsiShapingOn)
+            prevPsiA = potentialCalc.ComputePotential(gameScenario.MatchManager.TeamA);
 
+        if (!NavShapingOn) return;
         float[] phi = navPotentialCalc.ComputePotentials(gameScenario.MatchManager.Units);
         foreach (var agent in agents)
             prevPhi[agent.UnitIndex] = phi[agent.UnitIndex];

@@ -61,6 +61,20 @@ public class RewardConfig
             _map[entry.itemName] = entry.value;
     }
 
+    /// <summary>Command-line flag that turns both potential shapings off (η = 0), so the
+    /// coordinator skips computing Ψ and Φ entirely. For runs whose reward is computed in Python
+    /// from observations (blackout_env reward_v2) or not used at all (evaluation, recording).</summary>
+    public const string NoShapingArg = "-noRewardShaping";
+
+    private static RewardConfig ApplyCommandLine(RewardConfig config)
+    {
+        if (Array.IndexOf(Environment.GetCommandLineArgs(), NoShapingArg) < 0) return config;
+        config.potentialEta = 0f;
+        config.navPotentialEta = 0f;
+        Debug.Log($"[RewardConfig] {NoShapingArg}: potential and nav shaping disabled");
+        return config;
+    }
+
     public static RewardConfig Load()
     {
         string path = System.IO.Path.Combine(Application.streamingAssetsPath, "reward_config.json");
@@ -69,10 +83,11 @@ public class RewardConfig
             Debug.LogError($"[RewardConfig] {path} not found. Falling back to class defaults " +
                             "(all fixed event rewards 0, shaping hyperparameters at their Phase 1/1.5 " +
                             "design values) — verify StreamingAssets was packaged with this build.");
-            return new RewardConfig();
+            return ApplyCommandLine(new RewardConfig());
         }
         RewardConfig config = JsonUtility.FromJson<RewardConfig>(System.IO.File.ReadAllText(path));
         Debug.Log($"[RewardConfig] Loaded from {path}");
+        ApplyCommandLine(config);
         return config;
     }
 }
