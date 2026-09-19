@@ -11,6 +11,16 @@ using SensorCompressionType = Unity.MLAgents.Sensors.SensorCompressionType;
 /// Behavior Parameters: Vector Observation Size=RawObsSize(1), Continuous Actions=2, TeamId=0(A)/1(B).
 /// The shared 10-unit state table and game-state scalars are broadcast separately, once per
 /// step, by MapObsAgent — see MapObsAgent.cs.
+///
+/// Wire contract per unit (behavior "BlackOutUnit"):
+///   sends    : float32[1] = { unitIndex } (0-4 Team A, 5-9 Team B). Python's
+///              BlackOutEnv._extract_step reads only obs[0][0] to map agent_id → agent name; it is
+///              routing data, never a policy input. Reward and done flag ride along as usual.
+///   receives : ContinuousActions[2] = move (x, y) in [-1, 1] → GameScenario.MoveUnit (ignored
+///              unless GameState.Playing).
+///   cadence  : a new decision every decisionPeriod (2) FixedUpdates = 25 Hz at the 0.02 s fixed
+///              step; the ticks in between repeat the last action via RequestAction(). There is no
+///              DecisionRequester on Unit.prefab — this class owns the cadence (see FixedUpdate).
 /// </summary>
 public class BlackOutAgent : Agent
 {
@@ -21,14 +31,6 @@ public class BlackOutAgent : Agent
     private const int RawObsSize = 1;
 
     [SerializeField] private int unitIndex; // 0-4: Team A, 5-9: Team B
-
-    [Tooltip("Multi-arena scenes only (see ArenaDuplicator): -1 (default) means single-arena, " +
-        "in which case CollectObservations emits exactly the original 1-float observation and " +
-        "Prototype.unity is byte-for-byte unaffected by this field's existence. When >= 0, a " +
-        "2nd observation float is appended so Python can tell this unit's arena apart from the " +
-        "same unitIndex in a different arena -- every unit sharing this BehaviorName must agree " +
-        "on VectorObservationSize, so this must never be set on only some units in a scene.")]
-    [SerializeField] private int arenaIndex = -1;
 
     [Tooltip("Request a fresh decision every N FixedUpdate ticks; the previous action is " +
         "repeated on skipped ticks (replaces the DecisionRequester component, which this " +
@@ -60,9 +62,6 @@ public class BlackOutAgent : Agent
 
     public int UnitIndex => unitIndex;
 
-    /// <summary>Set by ArenaDuplicator when generating a multi-arena scene. See the field's doc comment.</summary>
-    public void SetArenaIndex(int index) => arenaIndex = index;
-
     /// <summary>
     /// Initializes agent references and subscribes to score events.
     /// Called once by <see cref="BlackOutEpisodeCoordinator"/> after <see cref="GameScenario.Initialize"/>.
@@ -77,6 +76,11 @@ public class BlackOutAgent : Agent
         myTeamCtx = matchManager.GetTeamContext(unit.Team);
         opponentCtx = matchManager.GetTeamContext(matchManager.OpponentTeam(unit.Team));
 
+        // Fixed per-event rewards (the team's original reward, commit 0dac1fd). Every value comes
+        // from reward_config.json and is currently 0, so these handlers add nothing today; the
+        // reward actually paid is the terminal ±1 plus Ψ/Φ shaping, both added by
+        // BlackOutEpisodeCoordinator (OnGameEnded, ApplyPotentialShaping, ApplyNavShaping).
+        // See Documentation/reward_shaping.md.
         // NOTE: score > 0 guard prevents false reward when TeamContext.Reset() fires OnScoreChanged(0).
         onMyTeamScored = score =>
         {
@@ -151,6 +155,9 @@ public class BlackOutAgent : Agent
 
         // Assign the correct team-perspective RenderTexture to the sensor.
         // Must be done here (Awake phase) before Agent.OnEnable() calls InitializeSensors().
+        // Legacy path: Unit.prefab has no RenderTextureSensorComponent in the current setup (the map is
+        // sent once by MapObsAgent), so this block is a no-op unless one is added back by hand — and
+        // adding one would add a visual observation to BlackOutUnit that Python does not expect.
         var rtSensor = GetComponent<RenderTextureSensorComponent>();
         if (rtSensor != null)
         {
@@ -166,6 +173,9 @@ public class BlackOutAgent : Agent
     /// <summary>
     /// Notifies coordinator that this agent is ready.
     /// Coordinator starts a new game episode once all 10 agents have notified.
+    /// At an episode boundary this runs synchronously inside EndEpisode() (ML-Agents: NotifyAgentDone → _AgentReset →
+    /// OnEpisodeBegin), i.e. still inside BlackOutEpisodeCoordinator.OnGameEnded, after this
+    /// agent's terminal AgentInfo has already been queued.
     /// </summary>
     public override void OnEpisodeBegin()
     {
@@ -184,8 +194,6 @@ public class BlackOutAgent : Agent
     public override void CollectObservations(VectorSensor sensor)
     {
         sensor.AddObservation((float)unitIndex);
-        if (arenaIndex >= 0)
-            sensor.AddObservation((float)arenaIndex);
     }
 
     private void FixedUpdate()

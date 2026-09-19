@@ -30,18 +30,22 @@ public class MapObsAgent : Agent
     // unitIndex here — team is derived from block index in Python (fixed 0-4=A/5-9=B
     // convention), and unitIndex is carried separately by each BlackOutUnit agent's own
     // 1-float observation (needed for per-agent action/reward routing).
+    //
+    // Wire contract (float32[44]) — Python counterpart: blackout_env/env/my_obs_preprocessor.py
+    // MyObsPreprocessor.preprocess_agent_states / preprocess_team_states (RAW_VECTOR_SIZE = 44,
+    // asserted, so any size change here must be mirrored there and in this GameObject's
+    // BehaviorParameters.VectorObservationSize in Prototype.unity):
+    //   [4i+0] pos_x   unit i = matchManager.Units[i]; (GlobalPos - MapOriginWorld) / MapBounds * 2 - 1
+    //   [4i+1] pos_y   same, y component — both in [-1, 1]
+    //   [4i+2] holdingItemId  0 = nothing, -n = carrying n batteries (KnownItems[0]),
+    //                         k >= 2 = non-battery item KnownItems[k-1]
+    //   [4i+3] classId        index into coordinator.KnownClasses (-1 if not found)
+    //   [40] score_A / TargetScore      [41] score_B / TargetScore   (absolute, not observer-relative)
+    //   [42] 1 - EpisodeTimer.Ratio     [43] 1 - AbsorptionTimer.Ratio
     private const int NUnits = 10;
     private const int UnitBlockSize = 4;
     private const int ScalarCount = 4;
     private const int RawStateSize = NUnits * UnitBlockSize + ScalarCount;
-
-    // See BlackOutAgent.arenaIndex's doc comment -- same convention: -1 (default, single-arena)
-    // emits nothing extra so Prototype.unity is unaffected; a multi-arena scene sets this on
-    // every MapObsAgent, appending 1 float so Python can group each arena's broadcast state.
-    [SerializeField] private int arenaIndex = -1;
-
-    /// <summary>Set by ArenaDuplicator when generating a multi-arena scene.</summary>
-    public void SetArenaIndex(int index) => arenaIndex = index;
 
     private void Awake()
     {
@@ -72,6 +76,9 @@ public class MapObsAgent : Agent
         matchManager = scenario.MatchManager;
     }
 
+    // Every FixedUpdate (50 Hz), unlike BlackOutAgent's decisionPeriod-gated 25 Hz: on ticks where no
+    // unit decides, Python (BlackOutEnv._advance_until_ready) just steps again, so whichever tick
+    // the units do report on always has a fresh map/state broadcast next to it.
     private void FixedUpdate() => RequestDecision();
 
     /// <summary>
@@ -84,8 +91,6 @@ public class MapObsAgent : Agent
         if (matchManager == null)
         {
             for (int i = 0; i < RawStateSize; i++) sensor.AddObservation(0f);
-            if (arenaIndex >= 0)
-                sensor.AddObservation((float)arenaIndex);
             return;
         }
 
@@ -95,7 +100,7 @@ public class MapObsAgent : Agent
         foreach (Unit u in matchManager.Units)
         {
             // Normalized to [-1, 1] (not [0, 1]) so position is zero-centered like the other
-            // per-unit fields (team sign is already +-1); Python passes this through as-is
+            // per-unit fields (the team column Python adds is +-1); Python passes this through as-is
             // (see MyObsPreprocessor.preprocess_agent_states), so this is the only place the
             // scale is defined.
             sensor.AddObservation((u.GlobalPos - mapOrigin) / bounds * 2f - Vector2.one);
@@ -116,9 +121,6 @@ public class MapObsAgent : Agent
         sensor.AddObservation(matchManager.GetTeamContext(matchManager.TeamB).Score / targetScore);
         sensor.AddObservation(gameScenario.EpisodeTimer != null ? 1f - gameScenario.EpisodeTimer.Ratio : 1f);
         sensor.AddObservation(gameScenario.AbsorptionTimer != null ? 1f - gameScenario.AbsorptionTimer.Ratio : 1f);
-
-        if (arenaIndex >= 0)
-            sensor.AddObservation((float)arenaIndex);
     }
 
     public override void OnActionReceived(ActionBuffers actions) { }
@@ -126,8 +128,8 @@ public class MapObsAgent : Agent
 
 /// <summary>
 /// SensorComponent that creates a DynamicRTSensor at InitializeSensors time.
-/// The RenderTexture can be assigned before or after CreateSensors() is called;
-/// _pendingTexture covers the case where Setup hasn't run yet.
+/// The SemanticMapRenderer source can be assigned before or after CreateSensors() is called;
+/// _pendingSource covers the case where Setup hasn't run yet.
 /// </summary>
 public class DynamicRTSensorComponent : SensorComponent
 {
@@ -154,13 +156,18 @@ public class DynamicRTSensorComponent : SensorComponent
 /// It deliberately avoids a RenderTexture readback: headless/NullGfx R16 ReadPixels can
 /// return invalid constant data, and a GPU round-trip is unnecessary because the renderer
 /// already owns the exact CPU array.
+///
+/// Wire contract: ObservationSpec.Visual(1, H, W) with H/W = map tiles × resolutionScale (24×24 in
+/// Prototype.unity), Team A perspective only. Each float = packed ushort / PACK_DIVISOR (1024) —
+/// see SemanticMapRenderer for the bit layout. Python (MyObsPreprocessor.preprocess_graphic)
+/// recovers the integer with round(x * 1024) and builds Team B by swapping ally/enemy channels.
 /// </summary>
 internal class DynamicRTSensor : ISensor
 {
     private SemanticMapRenderer _source;
     private readonly string _name;
 
-    // Dimensions used for the ObservationSpec — updated when RT is first assigned.
+    // Dimensions used for the ObservationSpec — updated when the source is first assigned (SetSource).
     private int _width;
     private int _height;
     private ObservationSpec _spec;
@@ -168,7 +175,7 @@ internal class DynamicRTSensor : ISensor
     internal DynamicRTSensor(string name)
     {
         _name = name;
-        // Placeholder spec; real dimensions are set when SetRenderTexture is called.
+        // Placeholder spec; real dimensions are set when SetSource is called.
         _width = 1;
         _height = 1;
         _spec = ObservationSpec.Visual(1, _height, _width);
