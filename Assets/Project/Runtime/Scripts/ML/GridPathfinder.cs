@@ -3,9 +3,15 @@ using System.Collections.Generic;
 using UnityEngine;
 
 /// <summary>
-/// Grid shortest-path distance used by <see cref="PotentialRewardCalculator"/> and
-/// <see cref="IndividualNavPotentialCalculator"/> in place of the straight-line distance
-/// approximation noted as a known gap in reward_proposal.md §14.1/§14.3/§15.2/§15.7.
+/// Grid shortest-path distance used by <see cref="PotentialRewardCalculator"/> (hazard: battery ->
+/// nearest enemy) in place of the straight-line distance approximation noted as a known gap in
+/// reward_proposal.md §14.1/§14.3/§15.2/§15.7. <see cref="IndividualNavPotentialCalculator"/>
+/// originally called this too, but since 2026-09-15 it runs its own allocation-free copy of the same
+/// search (same move set, same no-corner-cutting rule) over cached per-team walkability arrays; this
+/// version allocates a Dictionary and heap per call and calls the walkability predicate per neighbor.
+///
+/// Distances are in tile steps (1 orthogonal, √2 diagonal); callers multiply by the tile's world
+/// size. Cells are map cells (MapManager.WorldToCell), and walkability is team-relative.
 ///
 /// Both call sites ask "how far is the nearest tile matching some condition" (nearest enemy,
 /// nearest unclaimed item, nearest storage tile that can accept this item) rather than "what
@@ -55,6 +61,8 @@ public static class GridPathfinder
         Func<Vector2Int, bool> isTarget,
         int maxVisited = 4096)
     {
+        // maxVisited caps how many cells are settled; hitting it returns null ("unreachable"), which
+        // PotentialRewardCalculator turns into its far-away sentinel.
         if (isTarget(startCell)) return (0f, startCell);
 
         var best = new Dictionary<Vector2Int, float> { [startCell] = 0f };

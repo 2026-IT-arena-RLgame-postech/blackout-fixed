@@ -9,6 +9,11 @@
 - Unity LifeCycle과 독립적인 수동 제어
 - Deterministic Simulation 지향
 
+> 이 문서는 `GameScenario` API 자체의 사용법입니다. 아래 `Agent` 예시는 설명용 의사 코드이며, 실제 학습 씬
+> (`Prototype.unity`)은 `BlackOutEpisodeCoordinator` + `BlackOutAgent` × 10 + `MapObsAgent` 구조로 되어 있습니다.
+> 실제 obs/action/에피소드 처리는 [ml_agent_design.md](./ml_agent_design.md), 최근 변경은
+> [changes_since_team_version.md](./changes_since_team_version.md)를 보세요.
+
 ---
 
 ## 🎮 GameScenario API

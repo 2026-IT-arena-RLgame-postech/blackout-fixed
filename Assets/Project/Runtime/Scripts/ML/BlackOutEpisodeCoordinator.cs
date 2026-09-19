@@ -20,12 +20,14 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     [Tooltip("Unit classes in observation encoding order (Worker, Guard, Carrier). Index = classId float.")]
     [SerializeField] private UnitData[] knownClasses;
 
+    // Index 0 must be the battery (encoded as -stack count); others encode as index+1 — see GetItemIndex.
     [Tooltip("Known item types in holdingItemId encoding order. Index+1 = float ID (0=none).")]
     [SerializeField] private ItemData[] knownItems;
 
     [Tooltip("Semantic map renderer (shared, one per scene). Renders ally/enemy ID map per team.")]
     [SerializeField] private SemanticMapRenderer semanticMapRenderer;
 
+    // Sends the Team A packed map (visual) + the 44-float shared state once per step; Python derives Team B.
     [Tooltip("Agent that broadcasts both team maps over gRPC (reduces graphic transmissions from 10 to 2).")]
     [SerializeField] private MapObsAgent mapObsAgent;
 
@@ -121,6 +123,18 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
     /// Called by each <see cref="BlackOutAgent.OnEpisodeBegin"/>.
     /// Starts a new game episode once all agents have confirmed they are ready.
     /// </summary>
+    /// <remarks>
+    /// Reset/terminal ordering at an episode boundary (all synchronous, inside one FixedUpdate):
+    ///   1. <see cref="OnGameEnded"/> gives each agent its ±1/0 and calls EndEpisode().
+    ///   2. EndEpisode() queues that agent's terminal AgentInfo, then calls its OnEpisodeBegin(),
+    ///      which arms BlackOutAgent's one-tick decision suppression and calls this method.
+    ///   3. The 10th call runs <see cref="BeginEpisode"/> — the map is regenerated right here,
+    ///      before the terminal AgentInfos have even been sent to Python.
+    /// Consequences: the MapObsAgent broadcast that Python receives together with the terminal
+    /// step can already show the NEW episode (scores 0, time_left ~1); BlackOutEnv detects that and
+    /// falls back to the previous scalars for the winner. And the next tick's unit decisions are
+    /// suppressed so they cannot overwrite the queued terminal info (d9140fe).
+    /// </remarks>
     public void NotifyAgentEpisodeBegin()
     {
         episodeBeginCount++;
@@ -208,7 +222,8 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
 
     /// <summary>
     /// Returns the index of <paramref name="itemData"/> within <see cref="KnownItems"/>, or -1 if not found.
-    /// Unity sends <c>index + 1</c> as the float holdingItemId (0 = no item).
+    /// MapObsAgent turns this into the float holdingItemId: 0 = no item, index 0 (battery) = -stack count,
+    /// index i >= 1 = i + 1. Must use the same order as SemanticMapRenderer's own knownItems array.
     /// </summary>
     public int GetItemIndex(ItemData itemData)
     {
@@ -218,6 +233,12 @@ public class BlackOutEpisodeCoordinator : MonoBehaviour
         return -1;
     }
 
+    /// <summary>
+    /// Terminal reward (±1 win/loss, 0 when <paramref name="winner"/> is null = draw) and EndEpisode()
+    /// for all 10 agents. Each EndEpisode() re-enters <see cref="NotifyAgentEpisodeBegin"/> before
+    /// returning, so the 10th iteration of this loop already starts the next episode — see the
+    /// ordering notes there.
+    /// </summary>
     private void OnGameEnded(TeamData winner)
     {
         MatchManager mm = gameScenario.MatchManager;

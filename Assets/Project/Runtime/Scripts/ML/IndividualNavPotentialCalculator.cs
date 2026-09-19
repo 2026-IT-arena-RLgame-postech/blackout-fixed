@@ -10,6 +10,17 @@ using UnityEngine;
 /// sub-goal: a ground battery while empty-handed, or the nearest own-team storage tile that can
 /// accept its held battery while carrying.
 ///
+/// Summary of the current rule (details in the dated notes below), with Saturate(d) = 1 - tanh(d / L),
+/// L = navPotentialScale, d in world units, w(item) = amount / MaxItemAmount for scoring batteries:
+///   Collectable holding battery Φ = w(held) · Saturate(d(unit -> nearest own storage tile that accepts it))
+///   Collectable holding other   Φ = 0
+///   empty-handed Collectable    Φ = w(b) · Saturate(d(unit -> b) + d(b -> accepting storage)) for the
+///                               ground battery b the team-level greedy assignment gave it, else 0
+///   Hunter (not Collectable, has Beats)  Φ = (base + (1 - base) · w(prey's cargo)) · Saturate(d(unit -> prey))
+///                               for the enemy the greedy assignment gave it, else 0
+///   any other unit              Φ = 0
+/// BlackOutEpisodeCoordinator.ApplyNavShaping pays η_nav[γΦ_i(s') - Φ_i(s)] to unit i's own agent only.
+///
 /// Distances are grid path distances (same move set and no-corner-cutting rule as
 /// <see cref="GridPathfinder"/>), walked as this unit's own team, rather than straight-line —
 /// §15.2/§15.7 flagged straight-line as a known approximation gap since a wall between a unit and
@@ -42,7 +53,7 @@ using UnityEngine;
 /// only when a carrier actually dies, every direction looked the same to the value function, and
 /// the Run 8 model's Hunters oscillated in place (blackout-env docs/offline_pretrain_runs.md).
 ///   - targets are enemy units this unit beats that do not beat it back (Hunter.asset beats
-///     Collector and Carrier; a mutual kill, were one ever configured, is not a pull);
+///     Collector, Carrier and Hunter; Hunter-vs-Hunter is mutual, so enemy Hunters are not a pull);
 ///   - weight = hunterPotentialBaseWeight + (1 - base) * the target's held-battery weight, so a
 ///     loaded carrier -- whose death Ψ already values -- is the strongest pull, and an empty-handed
 ///     unit is still worth closing on;

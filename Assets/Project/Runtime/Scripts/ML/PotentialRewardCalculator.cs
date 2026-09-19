@@ -7,6 +7,18 @@ using UnityEngine;
 /// Phase 1 design (see reward_proposal.md §14): Ψ_k(s) is a hand-designed function of
 /// confirmed score plus hazard-discounted provisional battery custody — no learned model,
 /// no self-play calibration loop, so there is no reward non-stationarity to manage.
+///
+///   Ψ_A(s) = tanh( (Score_A - Score_B + Σ_b sign_b · amount_b · survive_b) / potentialScale )
+///   survive_b = 1 if the enemy cannot reach the battery's tile at all (protected storage),
+///             else exp( -hazardCoefficient / max(d_enemy, 0.5) · τ )
+/// where b ranges over scoring batteries that are carried or sitting in an owned storage (field
+/// batteries count 0), sign_b = +1 if team A has custody and -1 if team B does, d_enemy is the grid
+/// path distance in world units from the battery to the nearest enemy unit, and τ is the seconds left
+/// until the next absorption. Ψ_B = -Ψ_A exactly.
+///
+/// Only Ψ_A is computed; BlackOutEpisodeCoordinator.ApplyPotentialShaping pays
+/// η[γΨ_A(s') - Ψ_A(s)] to all 5 team-A agents and its negation to all 5 team-B agents every
+/// physics tick while the game is Playing, so the term is zero-sum and not credited per unit.
 /// </summary>
 public class PotentialRewardCalculator
 {
@@ -41,6 +53,8 @@ public class PotentialRewardCalculator
         MatchManager mm = scenario.MatchManager;
         TeamData opponent = mm.OpponentTeam(team);
 
+        // Confirmed score (already absorbed) counts in full; custody of not-yet-absorbed batteries
+        // counts as its amount (score points) times the chance of still holding it at absorption.
         int scoreDiff = mm.GetTeamContext(team).Score - mm.GetTeamContext(opponent).Score;
 
         float provisionalDiff = 0f;

@@ -55,6 +55,15 @@ public class SemanticMapRenderer : MonoBehaviour
     private const int ITEM_SHIFT = BATTERY_SHIFT + BATTERY_BITS; // 7
 
     /// <summary>Divisor used to normalize the packed ushort into a float for the ML-Agents observation writer.</summary>
+    /// <remarks>
+    /// Contract with Python: blackout_env/env/my_obs_preprocessor.py MyObsPreprocessor.PACK_DIVISOR must
+    /// hold the same value — Python decodes with round(x * PACK_DIVISOR). It must also stay strictly
+    /// greater than the largest packed value (currently 1023 = 10 bits) so every value maps into [0, 1).
+    /// The shift/width constants above and the ID_* values below are mirrored there too
+    /// (BASE_MASK, BATTERY_SHIFT/MASK, ITEM_SHIFT/MASK, channel indices VOID..STORAGE_ENEMY);
+    /// change both sides together. StreamingAssets/semantic_map_config.json is NOT read by Unity and
+    /// its ids/item_id_offset/resolution_scale keys describe the old grayscale encoding.
+    /// </remarks>
     public const float PACK_DIVISOR = 1024f;
 
     // Base tile category IDs — must match MyObsPreprocessor's channel layout.
@@ -72,6 +81,11 @@ public class SemanticMapRenderer : MonoBehaviour
     /// <summary>RenderTexture for Team B agents (Team B = ally).</summary>
     public RenderTexture RenderTextureTeamB { get; private set; }
     /// <summary>CPU-side Team A packed pixels used by the headless ML sensor.</summary>
+    /// <remarks>
+    /// This array — not RenderTextureTeamA — is what reaches Python (DynamicRTSensor reads it directly).
+    /// Row-major, bottom row first (Texture2D order); the sensor flips rows. The Team B array/RT are
+    /// not sent over the wire at all: Python derives Team B from Team A.
+    /// </remarks>
     public ushort[] TeamAPixels => pixelsA;
     public int TextureWidth => texWidth;
     public int TextureHeight => texHeight;
@@ -278,7 +292,7 @@ public class SemanticMapRenderer : MonoBehaviour
         int py = Mathf.FloorToInt((worldPos.y - mapOrigin.y) * resolutionScale);
         if (px < 0 || px >= texWidth || py < 0 || py >= texHeight) return;
         int idx = py * texWidth + px;
-        pixels[idx] |= bits; // safe: base bits (0-2) never overlap item bits (3-8)
+        pixels[idx] |= bits; // safe: base bits (0-2) never overlap item bits (3-9)
     }
 
     private int GetItemIndex(ItemData itemData)
